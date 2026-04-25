@@ -1,0 +1,17 @@
+.version 8.5
+.target sm_90a
+.address_size 64
+
+.visible .entry test_distributed_shared_cluster_bitwise_atomic()
+{
+	.reg .b32 %r<4>;
+	.reg .b64 %rd<5>;
+	ld.param.b64 %rd1, [test_distributed_shared_cluster_bitwise_atomic_param_0];
+	atom.relaxed.sys.shared::cluster.and.b32 %r1, [%rd1], 1;
+	atom.relaxed.sys.shared::cluster.and.b64 %rd2, [%rd1], 1;
+	atom.relaxed.sys.shared::cluster.or.b32 %r2, [%rd1], 1;
+	atom.relaxed.sys.shared::cluster.or.b64 %rd3, [%rd1], 1;
+	atom.relaxed.sys.shared::cluster.xor.b32 %r3, [%rd1], 1;
+	atom.relaxed.sys.shared::cluster.xor.b64 %rd4, [%rd1], 1;
+	ret;
+}

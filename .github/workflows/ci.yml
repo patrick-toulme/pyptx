@@ -1,0 +1,29 @@
+name: CI
+
+# CPU tests only. Wheel building + PyPI publishing live in
+# build-wheels.yml — that workflow uses cibuildwheel to produce
+# properly auditwheel-repaired manylinux wheels for the full
+# Python × arch matrix. The plain `python -m build` job that used
+# to live here was producing a single mis-tagged `linux_x86_64`
+# wheel that PyPI rejects.
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test-cpu:
+    name: "CPU tests (Python ${{ matrix.python }})"
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: pip install -e ".[dev]"
+      - run: pytest tests/ --ignore=tests/test_external_corpus.py -q

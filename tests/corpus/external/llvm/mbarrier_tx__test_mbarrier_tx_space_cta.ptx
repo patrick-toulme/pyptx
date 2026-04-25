@@ -1,0 +1,15 @@
+.version 8.5
+.target sm_90a
+.address_size 64
+
+.visible .entry test_mbarrier_tx_space_cta()
+{
+	.reg .b32 %r<3>;
+	ld.param.b32 %r1, [test_mbarrier_tx_space_cta_param_0];
+	ld.param.b32 %r2, [test_mbarrier_tx_space_cta_param_1];
+	mbarrier.expect_tx.relaxed.cta.shared.b64 [%r1], %r2;
+	mbarrier.expect_tx.relaxed.cluster.shared.b64 [%r1], %r2;
+	mbarrier.complete_tx.relaxed.cta.shared.b64 [%r1], %r2;
+	mbarrier.complete_tx.relaxed.cluster.shared.b64 [%r1], %r2;
+	ret;
+}

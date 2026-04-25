@@ -1,0 +1,123 @@
+/* Brand palette — sampled from docs/assets/pyptx-logo.png.
+ *
+ *   --pyptx-blue:    #0030C0   royal blue, the `py` + icon main color
+ *   --pyptx-navy:    #001030   deep navy, the `ptx` text + headings
+ *   --pyptx-shadow:  #002090   inner shading / subtle accents
+ */
+
+:root {
+  --pyptx-blue: #0030C0;
+  --pyptx-navy: #001030;
+  --pyptx-shadow: #002090;
+
+  /* Light mode: royal-blue header (matches the brand), white chrome on it.
+   * Header primary is the same royal blue used in the logo's icon and
+   * "py" text, so the header bar and logo read as one cohesive block. */
+  --md-primary-fg-color: var(--pyptx-blue);
+  --md-primary-fg-color--light: #2050E0;
+  --md-primary-fg-color--dark: var(--pyptx-navy);
+  --md-primary-bg-color: #ffffff;
+  --md-primary-bg-color--light: rgba(255, 255, 255, 0.85);
+
+  --md-accent-fg-color: var(--pyptx-blue);
+  --md-accent-fg-color--transparent: rgba(0, 48, 192, 0.1);
+  --md-accent-bg-color: #ffffff;
+  --md-accent-bg-color--light: rgba(255, 255, 255, 0.7);
+}
+
+/* Dark mode (slate scheme): lighter accent for readability on dark bg. */
+[data-md-color-scheme="slate"] {
+  /* Keep the same royal-blue header in dark mode for brand consistency. */
+  --md-primary-fg-color: var(--pyptx-blue);
+  --md-primary-fg-color--light: #2050E0;
+  --md-primary-fg-color--dark: var(--pyptx-navy);
+
+  /* Brighter accent in dark mode so links are legible */
+  --md-accent-fg-color: #4A5FE8;
+  --md-accent-fg-color--transparent: rgba(74, 95, 232, 0.15);
+
+  /* Body text: brighter than Material's slate default so copy is easy
+   * to read. Material's default is ~87% white which can feel dim; bump
+   * to near-white. */
+  --md-default-fg-color:          hsla(220, 25%, 95%, 1);
+  --md-default-fg-color--light:   hsla(220, 25%, 88%, 1);
+  --md-default-fg-color--lighter: hsla(220, 25%, 75%, 0.6);
+  --md-default-fg-color--lightest: hsla(220, 25%, 75%, 0.2);
+
+  /* Links (body text anchors): use the bright accent, not navy.
+   * Material defaults --md-typeset-a-color to --md-primary-fg-color,
+   * which would be invisible navy-on-slate here. */
+  --md-typeset-a-color: #7B8EFF;
+}
+
+/* Widen the content area modestly so the shrunk pipeline diagrams and
+ * wide code blocks don't scroll on normal laptop screens. Material's
+ * default is ~61rem; 68rem gives ~11% more horizontal room, enough
+ * for the diagrams without making long paragraphs stretch. */
+.md-grid {
+  max-width: 68rem;
+}
+
+/* Left sidebar: top-level nav entries (pyptx, API Reference, Examples,
+ * Runtime, Guides) are the primary navigation landmarks. Make them
+ * bold and brand-navy in light mode, bold and bright-foreground in
+ * dark mode — not the muted gray Material uses by default. Applies to
+ * both section headers with children and single-page top-level links. */
+.md-nav--primary > .md-nav__list > .md-nav__item > .md-nav__link,
+.md-nav--primary > .md-nav__list > .md-nav__item > label.md-nav__link {
+  font-weight: 700 !important;
+  color: var(--pyptx-navy) !important;
+  opacity: 1 !important;
+}
+
+[data-md-color-scheme="slate"] .md-nav--primary > .md-nav__list > .md-nav__item > .md-nav__link,
+[data-md-color-scheme="slate"] .md-nav--primary > .md-nav__list > .md-nav__item > label.md-nav__link {
+  color: var(--md-default-fg-color) !important;
+}
+
+.md-header {
+  border-bottom: 1px solid rgba(0, 0, 0, 0.08);
+}
+
+/* The header logo is the full wordmark PNG (hex icon + "pyptx" text
+ * together). Hide Material's default site-name text next to it so
+ * "pyptx" doesn't appear twice, and give the logo enough height to
+ * render the wordmark legibly. The <a> wrapping .md-logo keeps the
+ * whole thing clickable back to the home page. */
+.md-header__title {
+  display: none;
+}
+.md-header__button.md-logo {
+  padding: 0.3rem 0.4rem;
+}
+.md-header__button.md-logo img,
+.md-header__button.md-logo svg {
+  height: 1.8rem;
+  width: auto;
+  /* The wordmark PNG is blue-on-transparent — flip to solid white so it
+   * reads cleanly against the royal-blue header bar. Works for any image
+   * content (brightness(0) makes everything black, invert(1) flips to
+   * pure white silhouette). */
+  filter: brightness(0) invert(1);
+}
+
+.md-typeset h1,
+.md-typeset h2,
+.md-typeset h3 {
+  letter-spacing: -0.02em;
+}
+
+.md-typeset code {
+  border-radius: 0.35rem;
+}
+
+/* Inline code tint to match the brand palette (subtle) */
+.md-typeset :not(pre) > code {
+  color: var(--pyptx-navy);
+  background-color: rgba(0, 48, 192, 0.06);
+}
+
+[data-md-color-scheme="slate"] .md-typeset :not(pre) > code {
+  color: #b9c5ff;
+  background-color: rgba(74, 95, 232, 0.15);
+}

@@ -1,0 +1,12 @@
+.version 8.5
+.target sm_100a
+.address_size 64
+
+.visible .entry test_tcgen05_alloc_shared_cg2()
+{
+	.reg .b32 %r<3>;
+	ld.param.b32 %r1, [test_tcgen05_alloc_shared_cg2_param_0];
+	ld.param.b32 %r2, [test_tcgen05_alloc_shared_cg2_param_1];
+	tcgen05.alloc.cta_group::2.sync.aligned.shared::cta.b32 [%r1], %r2;
+	ret;
+}

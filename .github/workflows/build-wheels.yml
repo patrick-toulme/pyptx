@@ -1,0 +1,146 @@
+name: Build wheels
+
+# Triggers: manual dispatch from the Actions UI, or a push to this branch.
+# No PyPI publish step yet — wheels land as workflow artifacts you can
+# download and inspect from the run summary.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [dev, main]
+    # Build on every push to dev/main; tags trigger the publish path
+    # below. No path filter — keeps the latest artifact in sync with
+    # the latest commit and catches packaging breakage right away.
+    tags: ['v*']
+
+jobs:
+  build_wheels:
+    name: wheels-${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04       # linux x86_64
+            arch_tag: x86_64
+          - os: ubuntu-24.04-arm   # linux aarch64 (native ARM runner)
+            arch_tag: aarch64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build wheels
+        uses: pypa/cibuildwheel@v2.21.3
+        env:
+          # py 3.10–3.13, manylinux only. Skip musllinux, i686, pypy.
+          CIBW_BUILD: "cp310-manylinux_* cp311-manylinux_* cp312-manylinux_* cp313-manylinux_*"
+          CIBW_SKIP: "*-musllinux_* *_i686 pp*"
+          CIBW_ARCHS_LINUX: auto
+          # manylinux_2_28 has gcc-toolset-13 (C++17 clean) and glibc 2.28,
+          # which matches every distro ML users actually run on.
+          CIBW_MANYLINUX_X86_64_IMAGE: manylinux_2_28
+          CIBW_MANYLINUX_AARCH64_IMAGE: manylinux_2_28
+          CIBW_BUILD_VERBOSITY: 1
+          # Smoke test: can we import pyptx from the installed wheel?
+          # No GPU needed — the shim is dlopen'd lazily on first kernel launch.
+          CIBW_TEST_COMMAND: 'python -c "import pyptx; print(pyptx.__version__)"'
+
+      - name: Upload wheels
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-linux-${{ matrix.arch_tag }}
+          path: wheelhouse/*.whl
+          if-no-files-found: error
+
+  # Pure-python wheel (py3-none-any). Fallback for macOS, Windows, and
+  # any Linux platform without a matching prebuilt. DSL / transpiler work;
+  # kernel launch raises a clear "Linux-only" error at runtime on non-Linux.
+  build_purepy_wheel:
+    name: purepy-wheel
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install --upgrade build
+      - name: Build pure-python wheel
+        env:
+          PYPTX_BUILD_SHIM: "0"
+        run: python -m build --wheel
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-purepy
+          path: dist/*.whl
+          if-no-files-found: error
+
+  build_sdist:
+    name: sdist
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install --upgrade build
+      - run: python -m build --sdist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  # Publish to PyPI on tag pushes (v*). Uses OIDC trusted publishing —
+  # no API token in the repo. Requires a "trusted publisher" registered
+  # on PyPI for this repo + workflow + environment. See README/docs.
+  publish:
+    name: Publish to PyPI
+    needs: [build_wheels, build_purepy_wheel, build_sdist]
+    runs-on: ubuntu-24.04
+    if: startsWith(github.ref, 'refs/tags/v')
+    environment:
+      name: pypi
+      url: https://pypi.org/p/pyptx
+    permissions:
+      id-token: write
+    steps:
+      - name: Download Linux wheels
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: wheels-linux-*
+          merge-multiple: true
+      - name: Download pure-python wheel
+        uses: actions/download-artifact@v4
+        with:
+          name: wheel-purepy
+          path: dist
+      - name: Download sdist
+        uses: actions/download-artifact@v4
+        with:
+          name: sdist
+          path: dist
+      - name: List artifacts
+        run: ls -la dist/
+      - name: Publish
+        uses: pypa/gh-action-pypi-publish@release/v1
+
+  # Convenience: one artifact with everything, so you can download a
+  # single zip from the run page instead of four.
+  bundle:
+    name: bundle-all
+    needs: [build_wheels, build_purepy_wheel, build_sdist]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: all
+      - name: Flatten
+        run: |
+          mkdir -p release
+          find all -type f \( -name '*.whl' -o -name '*.tar.gz' \) -exec cp -v {} release/ \;
+          ls -la release/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pyptx-dist-all
+          path: release/*
+          if-no-files-found: error

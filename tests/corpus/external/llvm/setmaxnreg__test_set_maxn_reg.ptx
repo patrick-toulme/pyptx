@@ -1,0 +1,10 @@
+.version 8.5
+.target sm_90a
+.address_size 64
+
+.visible .entry test_set_maxn_reg()
+{
+	setmaxnreg.inc.sync.aligned.u32 96;
+	setmaxnreg.dec.sync.aligned.u32 64;
+	ret;
+}

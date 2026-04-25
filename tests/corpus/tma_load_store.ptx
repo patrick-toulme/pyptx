@@ -1,0 +1,27 @@
+.version 8.5
+.target sm_90a
+.address_size 64
+
+.visible .entry tma_copy(
+	.param .u64 param_tensormap_a,
+	.param .u64 param_tensormap_c
+)
+{
+	.reg .b32 %r<10>;
+	.reg .b64 %rd<10>;
+	.reg .pred %p<5>;
+	.shared .align 128 .b8 smem_a[32768];
+	.shared .align 8 .b64 mbar[1];
+	mbarrier.init.shared.b64 [mbar], 1;
+	fence.mbarrier_init.release.cluster;
+	ld.param.u64 %rd0, [param_tensormap_a];
+	mov.u32 %r0, %ctaid.x;
+	mov.u32 %r1, 0;
+	cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes [smem_a], [%rd0, {%r0, %r1}], [mbar];
+	mbarrier.try_wait.shared.b64 %p0, [mbar], 0;
+	ld.param.u64 %rd1, [param_tensormap_c];
+	cp.async.bulk.tensor.2d.global.shared::cta.bulk_group [%rd1, {%r0, %r1}], [smem_a];
+	cp.async.bulk.commit_group;
+	cp.async.bulk.wait_group 0;
+	ret;
+}

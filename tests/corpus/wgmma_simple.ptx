@@ -1,0 +1,15 @@
+.version 8.5
+.target sm_90a
+.address_size 64
+
+.visible .entry wgmma_test()
+{
+	.reg .b32 %r<100>;
+	.reg .b64 %rd<50>;
+	.reg .pred %p<10>;
+	wgmma.mma_async.sync.aligned.m64n256k16.f32.e4m3.e4m3 {%r0, %r1, %r2, %r3, %r4, %r5, %r6, %r7, %r8, %r9, %r10, %r11, %r12, %r13, %r14, %r15}, %rd0, %rd1, 1, 1, 1;
+	wgmma.fence.sync.aligned;
+	wgmma.commit_group.sync.aligned;
+	wgmma.wait_group.sync.aligned 0;
+	ret;
+}

@@ -1,0 +1,15 @@
+.version 8.5
+.target sm_90a
+.address_size 64
+
+.visible .entry elect_sync_imm()
+{
+	.reg .pred %p<2>;
+	.reg .b32 %r<2>;
+	.reg .b16 %rs<2>;
+	elect.sync %r1|%p1, -1;
+	st.param.b32 [func_retval0], %r1;
+	selp.b16 %rs1, -1, 0, %p1;
+	st.param.b8 [func_retval0+4], %rs1;
+	ret;
+}

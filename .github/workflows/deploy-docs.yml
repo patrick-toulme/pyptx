@@ -1,0 +1,61 @@
+name: Deploy docs
+
+# Build the mkdocs site and deploy to GitHub Pages.
+# Triggers only on pushes to main (production) and manual dispatch —
+# dev pushes don't deploy to pyptx.dev.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Allow only one deploy at a time, but don't cancel an in-progress one
+# (so a finishing build doesn't get aborted by a queued one).
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build mkdocs site
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # mkdocs git plugins want full history
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install docs deps + system libs for the social plugin
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libcairo2 libfreetype6 libffi-dev libjpeg-dev libpng-dev
+          pip install -e ".[docs]"
+
+      - name: Build site
+        # Not --strict: mkdocs treats auto-generated API pages not in
+        # nav as warnings, plus a few autorefs false positives. Build
+        # itself succeeds.
+        run: mkdocs build
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    name: Deploy to GitHub Pages
+    needs: build
+    runs-on: ubuntu-24.04
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

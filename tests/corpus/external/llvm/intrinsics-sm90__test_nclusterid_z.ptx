@@ -1,0 +1,10 @@
+.version 8.5
+.target sm_90a
+.address_size 64
+
+.visible .entry test_nclusterid_z()
+{
+	.reg .b32 %r<1>;
+	mov.u32 %r0, %nclusterid.z;
+	ret;
+}
