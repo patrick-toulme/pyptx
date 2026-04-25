@@ -1,0 +1,17 @@
+.version 8.5
+.target sm_90a
+.address_size 64
+
+.visible .entry branch_test()
+{
+	.reg .pred %p<5>;
+	.reg .b32 %r<5>;
+	setp.eq.s32 %p0, %r0, 0;
+	@%p0 bra THEN;
+	mov.b32 %r1, 0;
+	bra ENDIF;
+THEN:
+	mov.b32 %r1, 1;
+ENDIF:
+	ret;
+}

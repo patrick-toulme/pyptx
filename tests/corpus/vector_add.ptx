@@ -1,0 +1,36 @@
+.version 8.5
+.target sm_90a
+.address_size 64
+
+.visible .entry vector_add(
+	.param .u64 param0,
+	.param .u64 param1,
+	.param .u64 param2,
+	.param .u32 param3
+)
+{
+	.reg .b32 %r<10>;
+	.reg .b64 %rd<10>;
+	.reg .pred %p<5>;
+	ld.param.u64 %rd0, [param0];
+	ld.param.u64 %rd1, [param1];
+	ld.param.u64 %rd2, [param2];
+	ld.param.u32 %r0, [param3];
+	mov.u32 %r1, %tid.x;
+	mov.u32 %r2, %ctaid.x;
+	mov.u32 %r3, %ntid.x;
+	mad.lo.s32 %r4, %r2, %r3, %r1;
+	setp.ge.u32 %p0, %r4, %r0;
+	@%p0 bra DONE;
+	cvt.u64.u32 %rd3, %r4;
+	shl.b64 %rd4, %rd3, 2;
+	add.u64 %rd5, %rd0, %rd4;
+	add.u64 %rd6, %rd1, %rd4;
+	add.u64 %rd7, %rd2, %rd4;
+	ld.global.f32 %r5, [%rd5];
+	ld.global.f32 %r6, [%rd6];
+	add.f32 %r7, %r5, %r6;
+	st.global.f32 [%rd7], %r7;
+DONE:
+	ret;
+}

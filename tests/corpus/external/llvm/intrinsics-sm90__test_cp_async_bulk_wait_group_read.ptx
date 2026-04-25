@@ -1,0 +1,10 @@
+.version 8.5
+.target sm_90a
+.address_size 64
+
+.visible .entry test_cp_async_bulk_wait_group_read()
+{
+	cp.async.bulk.wait_group.read 8;
+	cp.async.bulk.wait_group.read 0;
+	ret;
+}

@@ -1,0 +1,18 @@
+.version 8.5
+.target sm_90a
+.address_size 64
+
+.visible .entry cp_async_bulk_s2g()
+{
+	.reg .b32 %r<3>;
+	.reg .b64 %rd<4>;
+	ld.param.b32 %r1, [cp_async_bulk_s2g_param_0];
+	ld.param.b64 %rd1, [cp_async_bulk_s2g_param_1];
+	ld.param.b32 %r2, [cp_async_bulk_s2g_param_2];
+	mov.b64 %rd2, 64;
+	cp.async.bulk.global.shared::cta.bulk_group.L2::cache_hint [%rd1], [%r1], %r2, %rd2;
+	ld.param.b64 %rd3, [cp_async_bulk_s2g_param_3];
+	cp.async.bulk.global.shared::cta.bulk_group [%rd1], [%r1], %r2;
+	cp.async.bulk.global.shared::cta.bulk_group.L2::cache_hint [%rd1], [%r1], %r2, %rd3;
+	ret;
+}

@@ -1,0 +1,13 @@
+.version 8.5
+.target sm_90a
+.address_size 64
+
+.visible .entry barriertestwaitshared()
+{
+	.reg .pred %p<2>;
+	.reg .b32 %r<1>;
+	.reg .b64 %rd<3>;
+	mbarrier.test_wait.shared.b64 %p0, [%r0], %rd0;
+	mbarrier.test_wait.shared.b64 %p1, [%rd1], %rd2;
+	ret;
+}

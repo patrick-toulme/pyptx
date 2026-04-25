@@ -1,0 +1,12 @@
+.version 8.5
+.target sm_90a
+.address_size 64
+
+.visible .entry nvvm_clusterlaunchcontrol_try_cancel()
+{
+	.reg .b32 %r<3>;
+	ld.param.b32 %r1, [nvvm_clusterlaunchcontrol_try_cancel_param_0];
+	ld.param.b32 %r2, [nvvm_clusterlaunchcontrol_try_cancel_param_1];
+	clusterlaunchcontrol.try_cancel.async.shared::cta.mbarrier::complete_tx::bytes.b128 [%r1], [%r2];
+	ret;
+}

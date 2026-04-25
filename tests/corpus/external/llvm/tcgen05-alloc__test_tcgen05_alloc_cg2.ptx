@@ -1,0 +1,13 @@
+.version 8.5
+.target sm_100a
+.address_size 64
+
+.visible .entry test_tcgen05_alloc_cg2()
+{
+	.reg .b32 %r<2>;
+	.reg .b64 %rd<2>;
+	ld.param.b64 %rd1, [test_tcgen05_alloc_cg2_param_0];
+	ld.param.b32 %r1, [test_tcgen05_alloc_cg2_param_1];
+	tcgen05.alloc.cta_group::2.sync.aligned.b32 [%rd1], %r1;
+	ret;
+}

@@ -1,0 +1,11 @@
+.version 8.5
+.target sm_90a
+.address_size 64
+
+.visible .entry test_barrier_cluster()
+{
+	barrier.cluster.arrive;
+	barrier.cluster.arrive.relaxed;
+	barrier.cluster.wait;
+	ret;
+}

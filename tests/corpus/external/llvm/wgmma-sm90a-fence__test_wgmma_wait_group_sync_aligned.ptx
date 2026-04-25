@@ -1,0 +1,9 @@
+.version 8.5
+.target sm_90a
+.address_size 64
+
+.visible .entry test_wgmma_wait_group_sync_aligned()
+{
+	wgmma.wait_group.sync.aligned 10;
+	ret;
+}

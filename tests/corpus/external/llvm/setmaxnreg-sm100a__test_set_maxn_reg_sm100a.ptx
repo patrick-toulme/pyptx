@@ -1,0 +1,10 @@
+.version 8.5
+.target sm_100a
+.address_size 64
+
+.visible .entry test_set_maxn_reg_sm100a()
+{
+	setmaxnreg.inc.sync.aligned.u32 96;
+	setmaxnreg.dec.sync.aligned.u32 64;
+	ret;
+}

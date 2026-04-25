@@ -1,0 +1,11 @@
+.version 8.5
+.target sm_100a
+.address_size 64
+
+.visible .entry test_tcgen05_commit_cg2()
+{
+	.reg .b64 %rd<2>;
+	ld.param.b64 %rd1, [test_tcgen05_commit_cg2_param_0];
+	tcgen05.commit.cta_group::2.mbarrier::arrive::one.shared::cluster.b64 [%rd1];
+	ret;
+}

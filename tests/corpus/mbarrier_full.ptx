@@ -1,0 +1,22 @@
+.version 8.5
+.target sm_90a
+.address_size 64
+
+.visible .entry mbarrier_test()
+{
+	.reg .b32 %r<10>;
+	.reg .b64 %rd<10>;
+	.reg .pred %p<5>;
+	.shared .align 8 .b64 mbar[4];
+	mbarrier.init.shared.b64 [mbar], 128;
+	mbarrier.init.shared.b64 [mbar+8], 128;
+	fence.mbarrier_init.release.cluster;
+	mbarrier.arrive.shared.b64 %rd0, [mbar];
+	mbarrier.arrive.expect_tx.shared.b64 %rd1, [mbar], 1024;
+	mbarrier.try_wait.shared.b64 %p0, [mbar], %rd0;
+	mbarrier.test_wait.shared.b64 %p1, [mbar], %rd0;
+	mbarrier.pending_count.b64 %r0, %rd0;
+	mbarrier.arrive_drop.shared.b64 %rd2, [mbar+8];
+	mbarrier.inval.shared.b64 [mbar];
+	ret;
+}

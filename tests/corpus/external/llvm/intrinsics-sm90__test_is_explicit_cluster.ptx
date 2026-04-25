@@ -1,0 +1,10 @@
+.version 8.5
+.target sm_90a
+.address_size 64
+
+.visible .entry test_is_explicit_cluster()
+{
+	.reg .pred %p<1>;
+	mov.pred %p0, %is_explicit_cluster;
+	ret;
+}

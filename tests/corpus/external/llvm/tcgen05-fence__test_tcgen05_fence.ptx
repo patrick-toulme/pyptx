@@ -1,0 +1,10 @@
+.version 8.5
+.target sm_100a
+.address_size 64
+
+.visible .entry test_tcgen05_fence()
+{
+	tcgen05.fence::before_thread_sync;
+	tcgen05.fence::after_thread_sync;
+	ret;
+}

@@ -1,0 +1,25 @@
+.version 8.5
+.target sm_90a
+.address_size 64
+
+.visible .entry test_distributed_shared_cluster_int_atomic()
+{
+	.reg .b32 %r<9>;
+	.reg .b64 %rd<8>;
+	ld.param.b64 %rd1, [test_distributed_shared_cluster_int_atomic_param_0];
+	atom.relaxed.sys.shared::cluster.add.u32 %r1, [%rd1], 1;
+	atom.relaxed.sys.shared::cluster.add.u64 %rd2, [%rd1], 1;
+	atom.relaxed.sys.shared::cluster.exch.b32 %r2, [%rd1], 1;
+	atom.relaxed.sys.shared::cluster.exch.b64 %rd3, [%rd1], 1;
+	atom.relaxed.sys.shared::cluster.min.s32 %r3, [%rd1], 1;
+	atom.relaxed.sys.shared::cluster.min.s64 %rd4, [%rd1], 1;
+	atom.relaxed.sys.shared::cluster.min.u32 %r4, [%rd1], 1;
+	atom.relaxed.sys.shared::cluster.min.u64 %rd5, [%rd1], 1;
+	atom.relaxed.sys.shared::cluster.max.s32 %r5, [%rd1], 1;
+	atom.relaxed.sys.shared::cluster.max.s64 %rd6, [%rd1], 1;
+	atom.relaxed.sys.shared::cluster.max.u32 %r6, [%rd1], 1;
+	atom.relaxed.sys.shared::cluster.max.u64 %rd7, [%rd1], 1;
+	atom.relaxed.sys.shared::cluster.inc.u32 %r7, [%rd1], 1;
+	atom.relaxed.sys.shared::cluster.dec.u32 %r8, [%rd1], 1;
+	ret;
+}

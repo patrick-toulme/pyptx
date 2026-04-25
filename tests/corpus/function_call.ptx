@@ -1,0 +1,19 @@
+.version 8.5
+.target sm_90a
+.address_size 64
+
+.func (.reg .b32 rv) add_one(
+	.reg .b32 x
+)
+{
+	add.s32 rv, x, 1;
+	ret;
+}
+
+.visible .entry call_test()
+{
+	.reg .b32 %r<5>;
+	mov.b32 %r0, 42;
+	call (%r1), add_one, (%r0);
+	ret;
+}

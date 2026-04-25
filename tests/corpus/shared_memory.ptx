@@ -1,0 +1,15 @@
+.version 8.5
+.target sm_90a
+.address_size 64
+
+.visible .entry smem_test()
+{
+	.reg .b32 %r<5>;
+	.reg .b64 %rd<5>;
+	.shared .align 128 .b8 smem[49152];
+	mov.u64 %rd0, smem;
+	ld.shared.b32 %r0, [%rd0];
+	st.shared.b32 [%rd0+4], %r0;
+	bar.sync 0;
+	ret;
+}

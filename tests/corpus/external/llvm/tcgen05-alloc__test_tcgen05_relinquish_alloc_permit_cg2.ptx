@@ -1,0 +1,9 @@
+.version 8.5
+.target sm_100a
+.address_size 64
+
+.visible .entry test_tcgen05_relinquish_alloc_permit_cg2()
+{
+	tcgen05.relinquish_alloc_permit.cta_group::2.sync.aligned;
+	ret;
+}
