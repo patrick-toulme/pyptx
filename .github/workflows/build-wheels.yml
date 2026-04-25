@@ -7,8 +7,8 @@ name: Build wheels
 on:
   workflow_dispatch:
   push:
-    branches: [dev, main]
-    # Build on every push to dev/main; tags trigger the publish path
+    branches: [main]
+    # Build on every push to main; tags trigger the publish path
     # below. No path filter — keeps the latest artifact in sync with
     # the latest commit and catches packaging breakage right away.
     tags: ['v*']

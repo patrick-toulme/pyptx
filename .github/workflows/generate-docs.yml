@@ -2,12 +2,7 @@ name: Generate Docs
 
 on:
   push:
-    # Only auto-regenerate on dev pushes. main is the public release
-    # branch and stays as a single clean "Initial release of pyptx"
-    # commit by Patrick alone — bot auto-commits would break that.
-    # Auto-generated docs on dev are current before any dev → main
-    # release flow, so main never falls behind.
-    branches: [dev]
+    branches: [main]
   workflow_dispatch:
 
 permissions:
