@@ -7,7 +7,7 @@ Short version:
 | **Triton** | tile / compiler | tile program | auto (via `tl.dot`) | auto (via `tl.dot`) | no |
 | **cuTile (NVIDIA)** | tile / compiler | tile program | auto | auto | no |
 | **CuTe DSL (NVIDIA)** | CuTe atoms / layouts | atom-level ops | yes (atom) | yes (atom) | no |
-| **JAX Pallas (Mosaic-GPU)** | MLIR primitives | primitive calls | yes (`plgpu.wgmma`) | yes (`plgpu.tcgen05_mma`) | no |
+| **Pallas (Mosaic-GPU)** | MLIR primitives | primitive calls | yes (`plgpu.wgmma`) | yes (`plgpu.tcgen05_mma`) | no |
 | **cuda-python** | driver API | driver calls (PTX is a string) | N/A (no DSL) | N/A | no |
 | **Numba CUDA** | Python subset | Python | no | no | no |
 | **pyptx** | raw PTX | one PTX instruction per call | yes | yes | yes (byte-identical) |
@@ -93,10 +93,13 @@ Python. CuTe DSL doesn't consume PTX as input.
 - Reach for **pyptx** when you want PTX as the notation and the ability
   to read existing PTX kernels as editable Python.
 
-## vs JAX Pallas (Mosaic-GPU)
+## vs Pallas (Mosaic-GPU)
 
-Pallas is JAX's kernel extension mechanism. Its GPU backend (Mosaic-GPU)
-covers Hopper and Blackwell with genuine user-callable primitives:
+Pallas is a kernel extension mechanism originally from JAX, callable
+from both JAX (via an XLA `CustomCall` wrapper) and PyTorch (via a
+direct path that doesn't involve XLA at all). Its GPU backend
+(Mosaic-GPU) covers Hopper and Blackwell with genuine user-callable
+primitives:
 `plgpu.wgmma`, `plgpu.tcgen05_mma`, `plgpu.async_load_tmem` /
 `async_store_tmem` / `wait_load_tmem`, TMA primitives, and barrier
 support with `orders_tensor_core=True` for tensor-core sync. It's a
@@ -106,32 +109,40 @@ Pallas and pyptx sit at different layers:
 
 - **Pallas / Mosaic-GPU**: you call DSL primitives. The Mosaic lowering
   handles MLIR → LLVM → PTX. Instruction-level decisions (scheduling,
-  register allocation, barrier insertion) belong to the compiler. The
-  set of available operations is what Mosaic-GPU developers have
-  surfaced.
-- **pyptx**: you call PTX instructions. No MLIR, no compiler between
-  you and the driver. One call = one instruction. `ptx.inst.*` makes
-  any PTX instruction callable, including ones Mosaic-GPU hasn't
-  wrapped.
+  register allocation, barrier insertion) belong to the compiler.
+  Pallas also exposes `plgpu.inline_mgpu`, which drops to the MLIR
+  layer and lets you put inline PTX directly into a kernel — so you're
+  not strictly limited to the high-level primitive set.
+- **pyptx**: you call PTX instructions directly from Python. No MLIR
+  layer, no LLVM, no compiler between you and the emitted PTX text.
+  One call = one instruction. `ptx.inst.*` makes any PTX instruction
+  callable.
 
 Other practical differences:
 
-- Pallas is JAX-only; pyptx is callable from both `jax.jit` and
-  PyTorch (`torch.compile`, eager, C++ extension dispatch).
-- Pallas lowers through XLA; pyptx compiles PTX via `cuModuleLoadData`
-  with no XLA dependency. Both approaches work — they're different
-  integration points.
+- Both Pallas and pyptx are callable from JAX *and* PyTorch — Pallas
+  via an XLA `CustomCall` when invoked from `jax.jit` (and a separate
+  Torch path that doesn't go through XLA at all); pyptx via a typed
+  XLA FFI handler for JAX and a ctypes / C++ extension path for
+  PyTorch.
+- Under the hood both ultimately load the compiled kernel via
+  `cuModuleLoadData` — that's the same driver API in either case.
+  The "XLA" path differs only in the dispatch wrapper: Pallas uses
+  `CustomCall`, pyptx uses XLA FFI.
 - Pyptx has a PTX transpiler (PTX → editable Python, byte-identical
-  round-trip); Pallas doesn't consume PTX as input.
+  round-trip on 218+ corpus kernels); Pallas doesn't consume PTX as
+  input.
 
-- Reach for **Pallas** when you're in JAX, you want the Mosaic-GPU
-  abstraction, and the primitives it offers cover what you need.
-- Reach for **pyptx** when you want the raw PTX visible, or you need
-  an instruction Mosaic-GPU hasn't wrapped, or you want to read an
-  existing PTX kernel as Python.
+- Reach for **Pallas** when you want the Mosaic-GPU abstraction, the
+  primitives it offers cover most of what you need, and you're happy
+  to drop to `inline_mgpu` for the rest.
+- Reach for **pyptx** when you want raw PTX visible at the Python
+  call site without an MLIR layer, or you want to read an existing
+  PTX kernel as editable Python.
 
-Pyptx kernels are callable from `jax.jit` via a typed FFI handler, so
-you can mix Pallas kernels and pyptx kernels in the same JAX program.
+Pyptx kernels and Pallas kernels can coexist in the same JAX program
+— pyptx registers its own typed FFI handler so it dispatches
+alongside Pallas's `CustomCall` cleanly.
 
 ## vs cuda-python / CUDA Python
 
