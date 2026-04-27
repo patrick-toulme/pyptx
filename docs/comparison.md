@@ -121,14 +121,11 @@ Pallas and pyptx sit at different layers:
 Other practical differences:
 
 - Both Pallas and pyptx are callable from JAX *and* PyTorch — Pallas
-  via an XLA `CustomCall` when invoked from `jax.jit` (and a separate
-  Torch path that doesn't go through XLA at all); pyptx via a typed
-  XLA FFI handler for JAX and a ctypes / C++ extension path for
-  PyTorch.
+  via an XLA `CustomCall` when invoked from `jax.jit`, and a separate
+  torch path; pyptx via a typed XLA FFI handler (itself a `CustomCall`
+  variant) for JAX, and a ctypes / C++ extension path for PyTorch.
 - Under the hood both ultimately load the compiled kernel via
   `cuModuleLoadData` — that's the same driver API in either case.
-  The "XLA" path differs only in the dispatch wrapper: Pallas uses
-  `CustomCall`, pyptx uses XLA FFI.
 - Pyptx has a PTX transpiler (PTX → editable Python, byte-identical
   round-trip on 218+ corpus kernels); Pallas doesn't consume PTX as
   input.
