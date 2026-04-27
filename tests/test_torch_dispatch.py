@@ -80,6 +80,17 @@ class TestTorchDispatch:
         assert torch.allclose(out, ref, atol=1e-4, rtol=1e-3), \
             f"max_abs={float((out - ref).abs().max()):g}"
 
+    def test_softmax(self):
+        from examples.hopper.softmax import build_softmax
+        B, N = 16, 512
+        k = build_softmax(B, N)
+        torch.manual_seed(5)
+        x = torch.randn(B, N, device="cuda")
+        out = k(x)
+        ref = torch.softmax(x, dim=-1)
+        assert torch.allclose(out, ref, atol=1e-4, rtol=1e-3), \
+            f"max_abs={float((out - ref).abs().max()):g}"
+
     def test_grouped_gemm_wgmma_tma(self):
         """The hardest path: wgmma + TMA descriptors under torch."""
         from examples.hopper.grouped_gemm import build_grouped_gemm

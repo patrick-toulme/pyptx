@@ -58,6 +58,7 @@ launch (drops dispatch overhead from ~34 µs to ~14 µs).
 | **RMS norm** (f32) | B=2048 N=8192 | 2.6 TB/s (88% HBM) | **3.9×** torch |
 | **Layer norm** (f32) | B=2048 N=8192 | 2.5 TB/s (83% HBM) | **1.5×** `F.layer_norm` |
 | **SwiGLU** (f32) | M=2048 F=8192 | 2.8 TB/s (94% HBM) | **1.6×** `F.silu(g)*u` |
+| **Softmax** (f32, row-wise) | B=2048 N=8192 | 2.8 TB/s (95% HBM) | **1.16×** `torch.softmax` |
 | **Flash attention** (bf16) | M=N=4096, HD=64 | 88 µs | **3.0×** naive torch |
 
 Full benchmark tables + reproduction commands:

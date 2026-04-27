@@ -117,6 +117,18 @@ JAX and PyTorch references.
 
     `~180 lines · v4 ld/st · bandwidth-bound`
 
+-   :material-chart-bell-curve: **[Softmax](hopper/softmax.md)**
+
+    ---
+
+    **2.8 TB/s** at B=2048 N=8192 f32 (95% of HBM3 peak). **1.16×**
+    faster than `torch.softmax`.
+
+    One CTA per row. v4 loads. Two-pass: warp reduce for max, then
+    `ex2(fma(x, log2e, -m·log2e))` and warp reduce for the sum.
+
+    `~230 lines · v4 ld/st · bandwidth-bound`
+
 -   :material-eye: **[Flash attention (Hopper)](hopper/experimental/flash_attention_hopper.md)**
 
     ---
