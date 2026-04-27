@@ -92,6 +92,23 @@ def swiglu():
         print(f"{M:5d} {F:6d} {t_p:8.2f}us {t_t:8.2f}us {bw(bytes_, t_p):11.1f} {bw(bytes_, t_t):11.1f} {t_t/t_p:8.2f}x")
 
 
+def softmax():
+    from examples.hopper.softmax import build_softmax
+    hdr("SOFTMAX (fp32, row-wise)")
+    print(f"{'B':>5} {'N':>6} {'pyptx':>9} {'torch':>9} {'pyptx GB/s':>11} {'torch GB/s':>11} {'speedup':>8}")
+    for B, N in [(32, 1024), (256, 4096), (1024, 8192), (2048, 8192)]:
+        k = build_softmax(B, N)
+        x = torch.randn(B, N, device="cuda")
+        k(x); torch.cuda.synchronize()
+        t_p = _time_events(lambda x: k(x), x) * 1e3
+        def ref(x):
+            return torch.softmax(x, dim=-1)
+        ref(x); torch.cuda.synchronize()
+        t_t = _time_events(ref, x) * 1e3
+        bytes_ = 2 * B * N * 4
+        print(f"{B:5d} {N:6d} {t_p:8.2f}us {t_t:8.2f}us {bw(bytes_, t_p):11.1f} {bw(bytes_, t_t):11.1f} {t_t/t_p:8.2f}x")
+
+
 def grouped_gemm():
     from examples.hopper.grouped_gemm import build_grouped_gemm
     hdr("GROUPED GEMM (bf16 -> fp32)")
@@ -150,6 +167,7 @@ def main():
     rms_norm()
     layer_norm()
     swiglu()
+    softmax()
     grouped_gemm()
     flash_attn()
     hopper_gemm()
@@ -159,6 +177,7 @@ if __name__ == "__main__":
     import sys
     dispatch = {
         "rms": rms_norm, "layer": layer_norm, "silu": swiglu,
+        "softmax": softmax,
         "grouped": grouped_gemm, "attn": flash_attn, "gemm": hopper_gemm,
     }
     targets = sys.argv[1:]
