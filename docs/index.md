@@ -76,11 +76,12 @@ from pyptx.types import f32, u32
     block=(128, 1, 1),
     arch="sm_90a",
 )
-def rms_norm(X, W, Y, *, N: int, eps: float = 1e-6):
+def rms_norm(X, W, Y, *, eps: float = 1e-6):
     partials = smem.alloc(f32, (4, 1))                # warp-partial sums
     px, pw, py = ptx.global_ptrs(X, W, Y)             # three param ptrs at once
     tid = reg.scalar(u32); ptx.inst.mov.u32(tid, ptx.special.tid.x())
     row = reg.scalar(u32); ptx.inst.mov.u32(row, ptx.special.ctaid.x())
+    N = X.shape[1]
     px += row * (N * 4); py += row * (N * 4)
 
     # Pass 1: v4 loads, accumulate sum-of-squares per thread.
