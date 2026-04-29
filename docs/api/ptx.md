@@ -1768,7 +1768,7 @@ dict(**kwargs) -> new dictionary initialized with the name=value pairs
 
 - Kind: `attribute`
 
-- Value: `<built-in method get of dict object at 0x7f37a3ba39c0>`
+- Value: `<built-in method get of dict object at 0x7f78ff0a7a00>`
 
 Return the value for key if key is in the dictionary, else default.
 
@@ -1776,7 +1776,7 @@ Return the value for key if key is in the dictionary, else default.
 
 - Kind: `attribute`
 
-- Value: `<built-in method setdefault of dict object at 0x7f37a3ba39c0>`
+- Value: `<built-in method setdefault of dict object at 0x7f78ff0a7a00>`
 
 Insert key with a value of default if key is not in the dictionary.
 
@@ -1786,7 +1786,7 @@ Return the value for key if key is in the dictionary, else default.
 
 - Kind: `attribute`
 
-- Value: `<built-in method pop of dict object at 0x7f37a3ba39c0>`
+- Value: `<built-in method pop of dict object at 0x7f78ff0a7a00>`
 
 D.pop(k[,d]) -> v, remove specified key and return the corresponding value.
 
@@ -1797,7 +1797,7 @@ raise a KeyError.
 
 - Kind: `attribute`
 
-- Value: `<built-in method popitem of dict object at 0x7f37a3ba39c0>`
+- Value: `<built-in method popitem of dict object at 0x7f78ff0a7a00>`
 
 Remove and return a (key, value) pair as a 2-tuple.
 
@@ -1808,7 +1808,7 @@ Raises KeyError if the dict is empty.
 
 - Kind: `attribute`
 
-- Value: `<built-in method keys of dict object at 0x7f37a3ba39c0>`
+- Value: `<built-in method keys of dict object at 0x7f78ff0a7a00>`
 
 D.keys() -> a set-like object providing a view on D's keys
 
@@ -1816,7 +1816,7 @@ D.keys() -> a set-like object providing a view on D's keys
 
 - Kind: `attribute`
 
-- Value: `<built-in method items of dict object at 0x7f37a3ba39c0>`
+- Value: `<built-in method items of dict object at 0x7f78ff0a7a00>`
 
 D.items() -> a set-like object providing a view on D's items
 
@@ -1824,7 +1824,7 @@ D.items() -> a set-like object providing a view on D's items
 
 - Kind: `attribute`
 
-- Value: `<built-in method values of dict object at 0x7f37a3ba39c0>`
+- Value: `<built-in method values of dict object at 0x7f78ff0a7a00>`
 
 D.values() -> an object providing a view on D's values
 
@@ -1832,7 +1832,7 @@ D.values() -> an object providing a view on D's values
 
 - Kind: `attribute`
 
-- Value: `<built-in method update of dict object at 0x7f37a3ba39c0>`
+- Value: `<built-in method update of dict object at 0x7f78ff0a7a00>`
 
 D.update([E, ]**F) -> None.  Update D from mapping/iterable E and F.
 If E is present and has a .keys() method, then does:  for k in E.keys(): D[k] = E[k]
@@ -1843,7 +1843,7 @@ In either case, this is followed by: for k in F:  D[k] = F[k]
 
 - Kind: `attribute`
 
-- Value: `<built-in method fromkeys of type object at 0x7f37a4d31f60>`
+- Value: `<built-in method fromkeys of type object at 0x7f7900331f60>`
 
 Create a new dictionary with keys from iterable and values set to value.
 
@@ -1851,7 +1851,7 @@ Create a new dictionary with keys from iterable and values set to value.
 
 - Kind: `attribute`
 
-- Value: `<built-in method clear of dict object at 0x7f37a3ba39c0>`
+- Value: `<built-in method clear of dict object at 0x7f78ff0a7a00>`
 
 D.clear() -> None.  Remove all items from D.
 
@@ -1859,6 +1859,6 @@ D.clear() -> None.  Remove all items from D.
 
 - Kind: `attribute`
 
-- Value: `<built-in method copy of dict object at 0x7f37a3ba39c0>`
+- Value: `<built-in method copy of dict object at 0x7f78ff0a7a00>`
 
 D.copy() -> a shallow copy of D
