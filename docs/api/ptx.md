@@ -44,6 +44,7 @@ Usage (inside a @kernel function):
 - [`range_`](#range-)
 - [`raw`](#raw)
 - [`wgmma`](#wgmma)
+- [`mma`](#mma)
 - [`cp`](#cp)
 - [`mbarrier`](#mbarrier)
 - [`fence`](#fence)
@@ -784,6 +785,53 @@ addresses:
   idx  = bits >> 4
   desc = cvt.u64.u32(idx) | const_bits
 
+<a id="mma"></a>
+
+## `mma`
+
+- Kind: `namespace`
+
+- Type: `_Mma`
+
+``ptx.mma.sync(...)`` — Ampere / Volta warp-scope tensor-core MMA.
+
+Emits ``mma.sync.aligned.{shape}.{a_layout}.{b_layout}.{dtype_d}.{dtype_a}.{dtype_b}.{dtype_c}``.
+
+Standard Ampere bf16 m16n8k16 example::
+
+    ptx.mma.sync(
+        shape=(16, 8, 16),
+        dtype_d=f32, dtype_a=bf16, dtype_b=bf16, dtype_c=f32,
+        d=acc, a=a_fr, b=b_fr, c=acc,   # c is the in-place accumulator
+        a_layout="row", b_layout="col",
+    )
+
+Per-thread fragment counts for the canonical
+``m16n8k16.f32.bf16.bf16.f32`` form (32 threads / warp):
+
+- ``a``: 4 b32 regs (each holds 2 packed bf16) = 8 bf16 elements / thread
+- ``b``: 2 b32 regs (each holds 2 packed bf16) = 4 bf16 elements / thread
+- ``d``: 4 f32 regs / thread
+- ``c``: 4 f32 regs / thread (typically the same registers as ``d``
+  for ``D = A*B + C`` accumulation in place)
+
+Other common variants:
+
+- ``shape=(16, 8, 8),  dtype_a=tf32`` — TF32 accumulator-into-f32
+- ``shape=(16, 8, 16), dtype_a=f16,  dtype_d=f16`` — fp16 in/out
+- ``shape=(16, 8, 32), dtype_a=s8,   dtype_d=s32`` — int8 → int32
+
+For Hopper warpgroup MMA, use :meth:`_Wgmma.mma_async` instead.
+For Blackwell tcgen05 MMA, use :meth:`_Tcgen05.mma` instead.
+
+### Members
+
+#### `sync(*, shape: 'tuple[int, int, int]', dtype_d: 'PtxType', dtype_a: 'PtxType', dtype_b: 'PtxType', dtype_c: 'PtxType', d: 'Any', a: 'Any', b: 'Any', c: 'Any', a_layout: 'str' = 'row', b_layout: 'str' = 'col', pred: "'Reg | NegPred | None'" = None) -> 'None'`
+
+- Kind: `method`
+
+No docstring yet.
+
 <a id="cp"></a>
 
 ## `cp`
@@ -1010,6 +1058,11 @@ ldmatrix(*, dst: 'RegArray | list[Reg]', src: 'Any', layout: 'str' = 'x4', trans
 ```
 
 Emit ldmatrix.sync.aligned.{layout}[.trans].shared.b16.
+
+``layout`` may be a single token (``"x4"``) or a dot-separated
+chain (``"m8n8.x4"``). Each dotted segment becomes its own PTX
+modifier — required because the validator wants ``.m8n8`` and
+``.x4`` as separate modifier groups (shape vs count).
 
 <a id="bar"></a>
 
@@ -1768,7 +1821,7 @@ dict(**kwargs) -> new dictionary initialized with the name=value pairs
 
 - Kind: `attribute`
 
-- Value: `<built-in method get of dict object at 0x7f78ff0a7a00>`
+- Value: `<built-in method get of dict object at 0x7f6bf5e4bcc0>`
 
 Return the value for key if key is in the dictionary, else default.
 
@@ -1776,7 +1829,7 @@ Return the value for key if key is in the dictionary, else default.
 
 - Kind: `attribute`
 
-- Value: `<built-in method setdefault of dict object at 0x7f78ff0a7a00>`
+- Value: `<built-in method setdefault of dict object at 0x7f6bf5e4bcc0>`
 
 Insert key with a value of default if key is not in the dictionary.
 
@@ -1786,7 +1839,7 @@ Return the value for key if key is in the dictionary, else default.
 
 - Kind: `attribute`
 
-- Value: `<built-in method pop of dict object at 0x7f78ff0a7a00>`
+- Value: `<built-in method pop of dict object at 0x7f6bf5e4bcc0>`
 
 D.pop(k[,d]) -> v, remove specified key and return the corresponding value.
 
@@ -1797,7 +1850,7 @@ raise a KeyError.
 
 - Kind: `attribute`
 
-- Value: `<built-in method popitem of dict object at 0x7f78ff0a7a00>`
+- Value: `<built-in method popitem of dict object at 0x7f6bf5e4bcc0>`
 
 Remove and return a (key, value) pair as a 2-tuple.
 
@@ -1808,7 +1861,7 @@ Raises KeyError if the dict is empty.
 
 - Kind: `attribute`
 
-- Value: `<built-in method keys of dict object at 0x7f78ff0a7a00>`
+- Value: `<built-in method keys of dict object at 0x7f6bf5e4bcc0>`
 
 D.keys() -> a set-like object providing a view on D's keys
 
@@ -1816,7 +1869,7 @@ D.keys() -> a set-like object providing a view on D's keys
 
 - Kind: `attribute`
 
-- Value: `<built-in method items of dict object at 0x7f78ff0a7a00>`
+- Value: `<built-in method items of dict object at 0x7f6bf5e4bcc0>`
 
 D.items() -> a set-like object providing a view on D's items
 
@@ -1824,7 +1877,7 @@ D.items() -> a set-like object providing a view on D's items
 
 - Kind: `attribute`
 
-- Value: `<built-in method values of dict object at 0x7f78ff0a7a00>`
+- Value: `<built-in method values of dict object at 0x7f6bf5e4bcc0>`
 
 D.values() -> an object providing a view on D's values
 
@@ -1832,7 +1885,7 @@ D.values() -> an object providing a view on D's values
 
 - Kind: `attribute`
 
-- Value: `<built-in method update of dict object at 0x7f78ff0a7a00>`
+- Value: `<built-in method update of dict object at 0x7f6bf5e4bcc0>`
 
 D.update([E, ]**F) -> None.  Update D from mapping/iterable E and F.
 If E is present and has a .keys() method, then does:  for k in E.keys(): D[k] = E[k]
@@ -1843,7 +1896,7 @@ In either case, this is followed by: for k in F:  D[k] = F[k]
 
 - Kind: `attribute`
 
-- Value: `<built-in method fromkeys of type object at 0x7f7900331f60>`
+- Value: `<built-in method fromkeys of type object at 0x7f6bf7131f60>`
 
 Create a new dictionary with keys from iterable and values set to value.
 
@@ -1851,7 +1904,7 @@ Create a new dictionary with keys from iterable and values set to value.
 
 - Kind: `attribute`
 
-- Value: `<built-in method clear of dict object at 0x7f78ff0a7a00>`
+- Value: `<built-in method clear of dict object at 0x7f6bf5e4bcc0>`
 
 D.clear() -> None.  Remove all items from D.
 
@@ -1859,6 +1912,6 @@ D.clear() -> None.  Remove all items from D.
 
 - Kind: `attribute`
 
-- Value: `<built-in method copy of dict object at 0x7f78ff0a7a00>`
+- Value: `<built-in method copy of dict object at 0x7f6bf5e4bcc0>`
 
 D.copy() -> a shallow copy of D

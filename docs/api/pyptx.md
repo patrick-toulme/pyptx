@@ -45,6 +45,7 @@ serve as the high-level entry point into each namespace.
 - [`Tile`](#tile)
 - [`Layout`](#layout)
 - [`differentiable_kernel`](#differentiable-kernel)
+- [`detect_arch`](#detect-arch)
 
 <a id="kernel"></a>
 
@@ -487,3 +488,42 @@ differentiable_kernel(forward_kernel, backward_kernel, **kwargs)
 Wrap forward + backward pyptx kernels for ``torch.autograd``.
 
 See :func:`pyptx.torch_support.differentiable_kernel` for full docs.
+
+<a id="detect-arch"></a>
+
+## `detect_arch`
+
+- Kind: `namespace`
+
+- Type: `_lru_cache_wrapper`
+
+Return the PTX arch string matching the first available CUDA device.
+
+Examples:
+    ``"sm_75"`` (T4),  ``"sm_80"`` (A100),  ``"sm_86"`` (RTX 30xx),
+    ``"sm_89"`` (L40 / RTX 40xx),  ``"sm_90a"`` (H100, H200),
+    ``"sm_100a"`` (B200, GB200),  ``"sm_120"`` (RTX Pro 6000
+    Blackwell, RTX 50xx).
+
+Cached after first call (the GPU on a process doesn't change).
+
+Raises:
+    RuntimeError: if no CUDA device is reachable.
+
+### Members
+
+#### `cache_info`
+
+- Kind: `attribute`
+
+- Value: `<built-in method cache_info of functools._lru_cache_wrapper object at 0x7f6bf6175bc0>`
+
+Report cache statistics
+
+#### `cache_clear`
+
+- Kind: `attribute`
+
+- Value: `<built-in method cache_clear of functools._lru_cache_wrapper object at 0x7f6bf6175bc0>`
+
+Clear the cache and cache statistics
