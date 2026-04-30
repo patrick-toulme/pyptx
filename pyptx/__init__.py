@@ -36,6 +36,7 @@ __version__ = "0.1.0"
 
 from pyptx.kernel import kernel
 from pyptx._intrinsic import intrinsic
+from pyptx._arch import detect_arch
 from pyptx.specs import Tile, Layout
 from pyptx import reg
 from pyptx import smem
@@ -52,5 +53,5 @@ def differentiable_kernel(forward_kernel, backward_kernel, **kwargs):
 
 __all__ = [
     "kernel", "reg", "smem", "ptx", "intrinsic",
-    "Tile", "Layout", "differentiable_kernel",
+    "Tile", "Layout", "differentiable_kernel", "detect_arch",
 ]

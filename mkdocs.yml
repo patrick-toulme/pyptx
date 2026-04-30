@@ -60,6 +60,7 @@ nav:
       - Hopper GEMM: guides/handwritten-gemm.md
       - Grouped GEMM: guides/grouped-gemm.md
       - Blackwell GEMM: guides/blackwell-gemm.md
+      - Ampere (A100) and arch="auto": guides/ampere.md
       - Debugging: guides/debugging.md
 
 plugins:

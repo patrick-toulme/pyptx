@@ -1181,6 +1181,91 @@ class _Wgmma:
 wgmma = _Wgmma()
 
 
+# -- mma.sync (Ampere/Volta tensor cores) ----------------------------------
+#
+# Modern Ampere bf16/fp16/tf32/int8 tensor-core MMA goes through
+# mma.sync.aligned. For Hopper warpgroup-scope MMA, use _Wgmma above.
+# For Blackwell tcgen05 MMA, see _Tcgen05 below.
+
+
+class _Mma:
+    """``ptx.mma.sync(...)`` — Ampere / Volta warp-scope tensor-core MMA.
+
+    Emits ``mma.sync.aligned.{shape}.{a_layout}.{b_layout}.{dtype_d}.{dtype_a}.{dtype_b}.{dtype_c}``.
+
+    Standard Ampere bf16 m16n8k16 example::
+
+        ptx.mma.sync(
+            shape=(16, 8, 16),
+            dtype_d=f32, dtype_a=bf16, dtype_b=bf16, dtype_c=f32,
+            d=acc, a=a_fr, b=b_fr, c=acc,   # c is the in-place accumulator
+            a_layout="row", b_layout="col",
+        )
+
+    Per-thread fragment counts for the canonical
+    ``m16n8k16.f32.bf16.bf16.f32`` form (32 threads / warp):
+
+    - ``a``: 4 b32 regs (each holds 2 packed bf16) = 8 bf16 elements / thread
+    - ``b``: 2 b32 regs (each holds 2 packed bf16) = 4 bf16 elements / thread
+    - ``d``: 4 f32 regs / thread
+    - ``c``: 4 f32 regs / thread (typically the same registers as ``d``
+      for ``D = A*B + C`` accumulation in place)
+
+    Other common variants:
+
+    - ``shape=(16, 8, 8),  dtype_a=tf32`` — TF32 accumulator-into-f32
+    - ``shape=(16, 8, 16), dtype_a=f16,  dtype_d=f16`` — fp16 in/out
+    - ``shape=(16, 8, 32), dtype_a=s8,   dtype_d=s32`` — int8 → int32
+
+    For Hopper warpgroup MMA, use :meth:`_Wgmma.mma_async` instead.
+    For Blackwell tcgen05 MMA, use :meth:`_Tcgen05.mma` instead.
+    """
+
+    def sync(
+        self,
+        *,
+        shape: tuple[int, int, int],
+        dtype_d: PtxType,
+        dtype_a: PtxType,
+        dtype_b: PtxType,
+        dtype_c: PtxType,
+        d: Any,
+        a: Any,
+        b: Any,
+        c: Any,
+        a_layout: str = "row",
+        b_layout: str = "col",
+        pred: "Reg | NegPred | None" = None,
+    ) -> None:
+        if a_layout not in ("row", "col"):
+            raise ValueError(
+                f"a_layout must be 'row' or 'col', got {a_layout!r}"
+            )
+        if b_layout not in ("row", "col"):
+            raise ValueError(
+                f"b_layout must be 'row' or 'col', got {b_layout!r}"
+            )
+        m, n, k = shape
+        mods = (
+            ".sync", ".aligned",
+            f".m{m}n{n}k{k}",
+            f".{a_layout}", f".{b_layout}",
+            dtype_d.ptx, dtype_a.ptx, dtype_b.ptx, dtype_c.ptx,
+        )
+
+        def _as_list(x: Any) -> list:
+            if isinstance(x, list):
+                return x
+            # RegArray-like: has .count and __getitem__
+            return [x[i] for i in range(x.count)]
+
+        operands = (_as_list(d), _as_list(a), _as_list(b), _as_list(c))
+        _emit("mma", mods, operands, pred=pred)
+
+
+mma = _Mma()
+
+
 # -- cp.async namespace ----------------------------------------------------
 
 class _TmaTensorOp:
@@ -1824,9 +1909,88 @@ class _CpAsyncBulk:
 
 
 class _CpAsync:
+    """``ptx.cp.async_`` namespace.
+
+    Hopper TMA bulk path lives under ``.bulk``. Ampere per-thread async
+    copies (``cp.async.cg`` / ``cp.async.ca``) and their commit/wait
+    helpers are exposed directly on this object.
+    """
+
     @property
     def bulk(self) -> _CpAsyncBulk:
         return _CpAsyncBulk()
+
+    # ---- Ampere per-thread async copy: cp.async.{cg,ca}.shared.global ----
+
+    def cg(
+        self,
+        smem_dst: Any,
+        global_src: Any,
+        byte_count: int,
+        *,
+        pred: "Reg | NegPred | None" = None,
+    ) -> None:
+        """Emit ``cp.async.cg.shared.global [smem_dst], [global_src], byteCount;``
+
+        ``cg`` = cache at L2 only (cache-global). ``byteCount`` must be 16
+        for fp16/bf16 v8 loads, or one of {4, 8, 16} per the PTX spec.
+        Used by Ampere SMEM-staging GEMM prefetch paths.
+        """
+        from pyptx.ir.nodes import ImmediateOperand
+        _emit(
+            "cp",
+            (".async", ".cg", ".shared", ".global"),
+            (smem_dst, global_src, ImmediateOperand(str(int(byte_count)))),
+            pred=pred,
+        )
+
+    def ca(
+        self,
+        smem_dst: Any,
+        global_src: Any,
+        byte_count: int,
+        *,
+        pred: "Reg | NegPred | None" = None,
+    ) -> None:
+        """Emit ``cp.async.ca.shared.global [smem_dst], [global_src], byteCount;``
+
+        ``ca`` = cache in both L1 and L2 (cache-all). ``byteCount`` is one
+        of {4, 8, 16}. Use over ``.cg`` when the same data is reused
+        within the SM and L1 caching helps.
+        """
+        from pyptx.ir.nodes import ImmediateOperand
+        _emit(
+            "cp",
+            (".async", ".ca", ".shared", ".global"),
+            (smem_dst, global_src, ImmediateOperand(str(int(byte_count)))),
+            pred=pred,
+        )
+
+    def commit_group(self, *, pred: "Reg | NegPred | None" = None) -> None:
+        """Emit ``cp.async.commit_group;``
+
+        Closes all preceding ``cp.async.{cg,ca}`` ops into one group that
+        can be waited on with ``wait_group(N)`` / ``wait_all()``.
+        """
+        _emit("cp", (".async", ".commit_group"), (), pred=pred)
+
+    def wait_group(self, n: int, *, pred: "Reg | NegPred | None" = None) -> None:
+        """Emit ``cp.async.wait_group N;`` — wait until at most N pending groups remain.
+
+        Standard SMEM ring-buffer prefetch pattern uses ``wait_group(stages-1)``
+        to hold one stage in flight while consuming the previous.
+        """
+        from pyptx.ir.nodes import ImmediateOperand
+        _emit(
+            "cp",
+            (".async", ".wait_group"),
+            (ImmediateOperand(str(int(n))),),
+            pred=pred,
+        )
+
+    def wait_all(self, *, pred: "Reg | NegPred | None" = None) -> None:
+        """Emit ``cp.async.wait_all;`` — wait until all pending cp.async ops complete."""
+        _emit("cp", (".async", ".wait_all"), (), pred=pred)
 
 
 class _Cp:
@@ -2341,8 +2505,17 @@ def ldmatrix(
     trans: bool = False,
     pred: Reg | NegPred | None = None,
 ) -> None:
-    """Emit ldmatrix.sync.aligned.{layout}[.trans].shared.b16."""
-    mods: list[str] = [".sync", ".aligned", f".{layout}"]
+    """Emit ldmatrix.sync.aligned.{layout}[.trans].shared.b16.
+
+    ``layout`` may be a single token (``"x4"``) or a dot-separated
+    chain (``"m8n8.x4"``). Each dotted segment becomes its own PTX
+    modifier — required because the validator wants ``.m8n8`` and
+    ``.x4`` as separate modifier groups (shape vs count).
+    """
+    mods: list[str] = [".sync", ".aligned"]
+    for part in layout.split("."):
+        if part:
+            mods.append(f".{part}")
     if trans:
         mods.append(".trans")
     mods.extend([".shared", ".b16"])

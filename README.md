@@ -6,19 +6,27 @@
 
 > Write PTX kernels in Python. Launch them from `jax.jit`, PyTorch, and `torch.compile`.
 
-`pyptx` is a Python DSL for handwritten PTX on NVIDIA Hopper (sm_90a) and
-Blackwell (sm_100a).
+`pyptx` is a Python DSL for handwritten PTX on NVIDIA Ampere (sm_80),
+Ada (sm_89), Hopper (sm_90a), Blackwell datacenter (sm_100a), and
+Blackwell workstation (sm_120). Pre-Ampere targets like Turing (sm_75,
+T4) work for kernels that stay within the sm_75 ISA — anything using
+`cp.async`, `mbarrier`, `bf16`, `wgmma`, `tcgen05`, or TMA needs an
+Ampere-or-newer card.
 
 One call = one instruction. No optimizer, no autotuner, no tensor IR between
 the Python function and the PTX it emits.
 
 - explicit registers, predicates, barriers, shared memory
+- Ampere: `mma.sync` (m16n8k{8,16,32}), `cp.async`, `ldmatrix`, SMEM staging
 - Hopper: WGMMA, TMA 2D/3D with multicast, mbarriers, cluster launch
 - Blackwell: `tcgen05.mma` / `.ld`, TMEM, SMEM descriptors, warp specialization
 - callable from JAX, PyTorch eager, and `torch.compile`
+- `arch="auto"` picks the right target for the current GPU at trace time
+  (validated on T4, A100, L4, H100, B200, RTX Pro 6000 Blackwell)
 - real PTX parser + emitter + **transpiler** — round-trips 218+ real PTX files byte-identical
 
 Docs: [pyptx.dev](https://pyptx.dev) · Examples:
+[`examples/ampere/`](examples/ampere),
 [`examples/hopper/`](examples/hopper),
 [`examples/blackwell/`](examples/blackwell) ·
 API: [pyptx.dev/api](https://pyptx.dev/api/)
@@ -60,6 +68,35 @@ launch (drops dispatch overhead from ~34 µs to ~14 µs).
 | **SwiGLU** (f32) | M=2048 F=8192 | 2.8 TB/s (94% HBM) | **1.6×** `F.silu(g)*u` |
 | **Softmax** (f32, row-wise) | B=2048 N=8192 | 2.8 TB/s (95% HBM) | **1.16×** `torch.softmax` |
 | **Flash attention** (bf16) | M=N=4096, HD=64 | 88 µs | **3.0×** naive torch |
+
+### Ampere (A100 80GB, bf16 / f32)
+
+| Kernel | Shape | pyptx | vs reference |
+| --- | --- | --- | --- |
+| **GEMM** (`ldmatrix.x4` + `cp.async` 4-stage + register frag double-buffer + XOR swizzle + serpentine `mma.sync`) | 4096³ bf16 | **162 TFLOPS** | cuBLAS 223 TFLOPS (**73%**) |
+| **GEMM** (same kernel) | 2048³ bf16 | **108 TFLOPS** | cuBLAS 158 TFLOPS (68%) |
+| **GEMM** (simple `mma.sync` + 2-stage pipeline, teaching kernel) | 4096³ bf16 | 64 TFLOPS | cuBLAS 230 TFLOPS (28%) |
+| **RMS norm** (f32) | B=2048 N=8192 | 928 GB/s | **2.2×** torch |
+| **SwiGLU** (f32) | M=2048 F=8192 | 1.33 TB/s | **1.35×** `F.silu(g)*u` |
+| **Layer norm** (f32) | B=2048 N=8192 | 916 GB/s | 0.89× `F.layer_norm` (torch's fused kernel is hard to beat) |
+
+A100 numbers reproduce via `python benchmarks/bench_ampere_kernels.py`.
+The high-perf A100 GEMM follows the CUTLASS SM80 / MatmulTutorial v15
+design pattern: 128×128×32 CTA tile, 4 warps in 2×2 owning 64×64
+output sub-tiles each, warp-collective `ldmatrix.x4` for SMEM→register
+fragment loads, **4-stage** `cp.async` ring buffer (3 in-flight),
+**register fragment double-buffering** that pre-loads the next
+K-iter's first K-block during the current iter's last `mma`,
+**CUTLASS XOR swizzle** (`atom ^= row & 3`) on all SMEM paths to
+eliminate ldmatrix bank conflicts, **serpentine N-fragment order** for
+adjacent-mma operand reuse, and per-thread offset hoisting so each
+inner-loop ldmatrix is one `add` instead of 5+ ops. 64
+`mma.sync.m16n8k16` per warp per K-iter (256 per CTA per K-iter). We
+haven't spent much time tuning this kernel — the 27% remaining gap is
+addressable (persistent / stream-K scheduling, more aggressive
+instruction-level overlap, autotuned tile sizes). See
+[`examples/ampere/gemm_highperf_ampere.py`](examples/ampere/gemm_highperf_ampere.py)
+for the full kernel.
 
 Full benchmark tables + reproduction commands:
 [pyptx.dev/performance](https://pyptx.dev/performance/).
@@ -137,6 +174,25 @@ exactly this workflow applied to
 ---
 
 ## Start here
+
+Ampere (sm_80):
+
+- `examples/ampere/rms_norm.py` / `layer_norm.py` / `swiglu.py` /
+  `softmax.py` — maintained Hopper kernels retargeted to `sm_80`.
+- `examples/ampere/gemm.py` — single-warp `mma.sync.aligned.m16n8k16` bf16
+  GEMM, no SMEM staging. The minimal end-to-end Ampere tensor-core path.
+- `examples/ampere/gemm_pipelined.py` — `cp.async` 2-stage SMEM ring buffer
+  + `mma.sync` on a 64×64 CTA tile (per-thread `ld.shared`, no `ldmatrix`).
+  The first-step pipelined kernel (~64 TFLOPS at 4096³).
+- `examples/ampere/gemm_highperf_ampere.py` — production-leaning A100 GEMM
+  following CUTLASS SM80 + MatmulTutorial v15. 128×128×32 CTA tile, 4
+  warps in 2×2 owning 64×64 each, `ldmatrix.x4`, **4-stage** `cp.async`
+  pipeline, **register frag double-buffering** across K-iters, **XOR
+  swizzle** + serpentine `mma`, 64 `mma.sync` per warp per K-iter.
+  **162 TFLOPS at 4096³ bf16** = 73% of cuBLAS (**2.5× the simpler
+  `gemm_pipelined.py`**). Bit-exact through 4096³.
+- `benchmarks/bench_ampere_kernels.py` — A100 RMSNorm, LayerNorm, SwiGLU,
+  and GEMM benchmark suite.
 
 Hopper (sm_90a):
 

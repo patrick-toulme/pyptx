@@ -261,6 +261,52 @@ def _seed_overloads() -> None:
         arch="sm_90",
     ))
 
+    # ---- Ampere plain cp.async commit/wait (no .bulk) ---------------------
+    # cp.async.commit_group — closes pending cp.async.{cg,ca} into a group.
+    register_overload(InstructionSpec(
+        opcode="cp",
+        modifier_groups=(
+            ModifierGroup("op", (".async",), required=True),
+            ModifierGroup("action", (".commit_group",), required=True),
+        ),
+        operand_pattern="",
+        min_operands=0,
+        max_operands=0,
+        description="cp.async.commit_group (Ampere) — close pending cp.async into a group",
+        since_version=(7, 0),
+        arch="sm_80",
+    ))
+
+    # cp.async.wait_group N — wait until at most N groups remain pending.
+    register_overload(InstructionSpec(
+        opcode="cp",
+        modifier_groups=(
+            ModifierGroup("op", (".async",), required=True),
+            ModifierGroup("action", (".wait_group",), required=True),
+        ),
+        operand_pattern="N",
+        min_operands=1,
+        max_operands=1,
+        description="cp.async.wait_group N (Ampere) — wait until <= N groups pending",
+        since_version=(7, 0),
+        arch="sm_80",
+    ))
+
+    # cp.async.wait_all — wait for all pending cp.async to complete.
+    register_overload(InstructionSpec(
+        opcode="cp",
+        modifier_groups=(
+            ModifierGroup("op", (".async",), required=True),
+            ModifierGroup("action", (".wait_all",), required=True),
+        ),
+        operand_pattern="",
+        min_operands=0,
+        max_operands=0,
+        description="cp.async.wait_all (Ampere) — wait for all pending cp.async",
+        since_version=(7, 0),
+        arch="sm_80",
+    ))
+
     # ---- tcgen05 (Blackwell) ---------------------------------------------
     # The base table holds a stripped-down tcgen05 spec; the full family
     # (alloc/dealloc/ld/st/cp/shift/commit/fence/wait/relinquish) is

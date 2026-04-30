@@ -320,12 +320,15 @@ def _default_version_for_arch(arch: str) -> tuple[int, int]:
 
     Hopper examples in this repo were originally emitted as PTX 8.5.
     Blackwell tcgen05 kernels need a newer PTX target than Hopper, but
-    CUDA 12.9 toolchains still top out at PTX 8.8. Default to the
-    newest version that assembles on the current Blackwell bring-up
-    stack instead of emitting PTX 9.2 unconditionally.
+    CUDA 12.9 toolchains still top out at PTX 8.8. Workstation Blackwell
+    (sm_120, RTX Pro 6000) was added in CUDA 12.8 / PTX 8.7. Default to
+    the newest version that assembles on the current bring-up stack for
+    each arch instead of emitting PTX 9.2 unconditionally.
     """
-    if arch.startswith("sm_100"):
+    if arch.startswith("sm_100") or arch.startswith("sm_101"):
         return (8, 8)
+    if arch.startswith("sm_12"):
+        return (8, 7)
     return (8, 5)
 
 
@@ -1017,6 +1020,19 @@ class Kernel:
                 module=cu_module,
             )
 
+            # If the shim is available but JIT-compile returned no CUfunction,
+            # the user is in a real-GPU runtime path missing cuda-python.
+            # Without this, the launch later fails with the cryptic
+            # "no launch config registered for handle N" from the C++ shim.
+            if cu_function is None and shim_is_available():
+                try:
+                    import cuda.bindings.driver  # noqa: F401
+                except ImportError:
+                    raise RuntimeError(
+                        "pyptx: PTX-to-cubin JIT requires cuda-python on a real "
+                        "GPU. Install it with: pip install cuda-python"
+                    )
+
             # If the shim and a real CUfunction are both available, push
             # the launch config into the shim's registry so XLA's dispatch
             # can find it. On laptop this is a no-op.
@@ -1210,6 +1226,9 @@ def kernel(
     *,
     arch: str = "sm_90a",
     version: tuple[int, int] | None = None,
+    # Auto-detection: pass arch="auto" to query the first CUDA device's
+    # compute capability and target that arch (e.g. "sm_80" on A100,
+    # "sm_90a" on H100, "sm_100a" on B200). See pyptx.detect_arch().
     in_specs: Sequence[Tile] | None = None,
     out_specs: Sequence[Tile] | None = None,
     grid: Any = None,
@@ -1241,10 +1260,18 @@ def kernel(
         )
         def gemm(A, B, C, *, BM=128): ...
     """
+    # Resolve arch="auto" once, here, so all build paths see a concrete
+    # arch string. Keeps Kernel.__init__ free of detection logic.
+    if arch == "auto":
+        from pyptx._arch import detect_arch
+        resolved_arch = detect_arch()
+    else:
+        resolved_arch = arch
+
     def _build(fn: Callable) -> Kernel:
         return Kernel(
             fn,
-            arch=arch,
+            arch=resolved_arch,
             version=version,
             in_specs=in_specs,
             out_specs=out_specs,

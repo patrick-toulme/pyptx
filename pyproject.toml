@@ -45,7 +45,7 @@ dependencies = []
 
 [project.optional-dependencies]
 jax = ["jax[cuda12]>=0.4.20", "cuda-python>=12.3"]
-torch = ["torch>=2.1"]
+torch = ["torch>=2.1", "cuda-python>=12.3"]
 docs = [
     "mkdocs-material[imaging]>=9.5",
     "mkdocstrings[python]>=0.25",

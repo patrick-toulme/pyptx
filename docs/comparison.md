@@ -2,15 +2,15 @@
 
 Short version:
 
-| Tool | Abstraction layer | User writes | Hopper WGMMA | Blackwell tcgen05 | Transpiles PTX? |
-| --- | --- | --- | --- | --- | --- |
-| **Triton** | tile / compiler | tile program | auto (via `tl.dot`) | auto (via `tl.dot`) | no |
-| **cuTile (NVIDIA)** | tile / compiler | tile program | auto | auto | no |
-| **CuTe DSL (NVIDIA)** | CuTe atoms / layouts | atom-level ops | yes (atom) | yes (atom) | no |
-| **Pallas (Mosaic-GPU)** | MLIR primitives | primitive calls | yes (`plgpu.wgmma`) | yes (`plgpu.tcgen05_mma`) | no |
-| **cuda-python** | driver API | driver calls (PTX is a string) | N/A (no DSL) | N/A | no |
-| **Numba CUDA** | Python subset | Python | no | no | no |
-| **pyptx** | raw PTX | one PTX instruction per call | yes | yes | yes (byte-identical) |
+| Tool | Abstraction layer | User writes | Ampere mma.sync | Hopper WGMMA | Blackwell tcgen05 | Transpiles PTX? |
+| --- | --- | --- | --- | --- | --- | --- |
+| **Triton** | tile / compiler | tile program | auto (via `tl.dot`) | auto (via `tl.dot`) | auto (via `tl.dot`) | no |
+| **cuTile (NVIDIA)** | tile / compiler | tile program | auto | auto | auto | no |
+| **CuTe DSL (NVIDIA)** | CuTe atoms / layouts | atom-level ops | yes (atom) | yes (atom) | yes (atom) | no |
+| **Pallas (Mosaic-GPU)** | MLIR primitives | primitive calls | limited | yes (`plgpu.wgmma`) | yes (`plgpu.tcgen05_mma`) | no |
+| **cuda-python** | driver API | driver calls (PTX is a string) | N/A (no DSL) | N/A | N/A | no |
+| **Numba CUDA** | Python subset | Python | no | no | no | no |
+| **pyptx** | raw PTX | one PTX instruction per call | yes (`ptx.mma.sync`) | yes | yes | yes (byte-identical) |
 
 The unique cell is the last row: pyptx is the only Python tool where *the function body is the PTX instruction stream*. Every other tool either (a) generates PTX for you from a higher-level description, or (b) hands PTX to the driver as an opaque string.
 
@@ -180,7 +180,11 @@ transpiler.
 ## When pyptx is the wrong answer
 
 - You want one kernel that runs on every NVIDIA GPU generation. Pyptx
-  targets Hopper (sm_90a) and Blackwell (sm_100a) specifically.
+  targets Ampere (sm_80, A100), Ada (sm_89, L4 / RTX 40xx), Hopper
+  (sm_90a, H100), Blackwell datacenter (sm_100a, B200), and Blackwell
+  workstation (sm_120, RTX Pro 6000 / RTX 50xx) as first-class arch
+  strings. Turing (sm_75, T4) works for kernels that stay within the
+  sm_75 ISA — pre-Volta is not supported.
 - You want the compiler to pick the schedule. Triton and cuTile will
   give you more perf per hour of engineering effort on standard
   patterns.
@@ -189,6 +193,10 @@ transpiler.
 
 ## When pyptx is the right answer
 
+- You're writing an **Ampere (A100)** kernel that needs `mma.sync`
+  m16n8k{8,16,32}, `cp.async` SMEM staging, `ldmatrix`, or other
+  sm_80 tensor-core path — and you want the fragment layout and
+  instruction order visible in Python.
 - You're writing a Hopper kernel that needs WGMMA, TMA 3D multicast,
   mbarrier phase tracking, or cluster launch explicitly — and you want
   the exact instruction sequence visible in Python.
