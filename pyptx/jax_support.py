@@ -344,7 +344,7 @@ def compile_ptx_to_cubin(
             kernel_name = _extract_entry_name(ptx_source)
 
         err, module = driver.cuModuleLoadData(ptx_source.encode())
-        if err == driver.CUresult.CUDA_ERROR_UNSUPPORTED_PTX_VERSION:
+        if err != driver.CUresult.CUDA_SUCCESS:
             fn, module = _compile_ptx_via_ptxas(
                 ptx_source=ptx_source,
                 arch=arch,
@@ -352,11 +352,6 @@ def compile_ptx_to_cubin(
                 driver=driver,
             )
         else:
-            if err != driver.CUresult.CUDA_SUCCESS:
-                raise RuntimeError(
-                    f"cuModuleLoadData failed: {err}. PTX source:\n{ptx_source[:500]}"
-                )
-
             err, fn = driver.cuModuleGetFunction(module, kernel_name.encode())
             if err != driver.CUresult.CUDA_SUCCESS:
                 raise RuntimeError(
