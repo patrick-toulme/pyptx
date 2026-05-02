@@ -13,6 +13,9 @@ Reaches **2.80 TB/s** at B=2048 N=8192 f32 on H100 (95% of HBM3 peak),
 moves 16 bytes. Bandwidth-bound at large shapes; small shapes are
 dispatch-bound (~18us floor) until CUDA-graph replay is wired in.
 
+Note this is faster due to torch using a more percise, therefore slower ::exp, thanks
+for @ezyang for noting this. 
+
 ``Y[b, i] = exp(X[b, i] - max(X[b, :])) / sum(exp(X[b, :] - max(X[b, :])))``
 
 One CTA per row. Each thread:
@@ -41,6 +44,9 @@ fma + rsqrt) and that we make two reduction passes instead of one.
     ``ld.global.v4.f32`` / ``st.global.v4.f32`` so every memory transaction
     moves 16 bytes. Bandwidth-bound at large shapes; small shapes are
     dispatch-bound (~18us floor) until CUDA-graph replay is wired in.
+
+    Note this is faster due to torch using a more percise, therefore slower ::exp, thanks
+    for @ezyang for noting this. 
 
     ``Y[b, i] = exp(X[b, i] - max(X[b, :])) / sum(exp(X[b, :] - max(X[b, :])))``
 
