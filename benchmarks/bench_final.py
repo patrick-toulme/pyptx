@@ -161,6 +161,21 @@ def grouped_gemm():
         print(f"{G:3d} {M:5d} {N:4d} {K:5d} {t_p:8.2f}us {tflops:8.1f}")
 
 
+def flash_norm_ampere():
+    from examples.ampere.flash_norm import build_flash_norm
+    from examples.ampere.rms_norm import build_rms_norm
+    hdr("FLASH NORM Ampere (fp32, sm_80) — norm sans weight vs RMS norm")
+    print(f"{'B':>5} {'N':>6} {'flash_norm':>11} {'rms_norm':>11} {'speedup':>8}")
+    for B, N in [(32, 1024), (256, 4096), (1024, 8192), (2048, 8192)]:
+        _, flash = build_flash_norm(B, N, N)
+        rms = build_rms_norm(B, N)
+        x = torch.randn(B, N, device="cuda")
+        w = torch.randn(N, device="cuda")
+        t_f = _time_events(lambda x: flash(x), x) * 1e3
+        t_r = _time_events(lambda x, w: rms(x, w), x, w) * 1e3
+        print(f"{B:5d} {N:6d} {t_f:10.2f}us {t_r:10.2f}us {t_r/t_f:8.2f}x")
+
+
 def flash_attn():
     from examples.hopper.experimental.flash_attention_hopper import build_flash_attention_hopper
     hdr("FLASH ATTENTION (Hopper BN=64 multi-k, bf16)")

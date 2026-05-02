@@ -9,7 +9,8 @@ Fused row-wise softmax tuned for Blackwell (sm_100a), written in pyptx,
 callable from JAX and PyTorch.
 
 Reaches **5.8 TB/s** at B=2048 N=8192 f32 on B200, **2.76x** faster than
-``torch.softmax`` eager.
+``torch.softmax`` eager, which is expected since softmax on torch uses
+std::exp which is slower.
 
 Thin arch wrapper around ``examples/hopper/softmax.py`` — same kernel,
 compiled for ``sm_100a`` to take advantage of Blackwell-specific PTX
@@ -27,7 +28,8 @@ path and a PyTorch eager path.
     callable from JAX and PyTorch.
 
     Reaches **5.8 TB/s** at B=2048 N=8192 f32 on B200, **2.76x** faster than
-    ``torch.softmax`` eager.
+    ``torch.softmax`` eager, which is expected since softmax on torch uses
+    std::exp which is slower.
 
     Thin arch wrapper around ``examples/hopper/softmax.py`` — same kernel,
     compiled for ``sm_100a`` to take advantage of Blackwell-specific PTX
