@@ -516,7 +516,7 @@ Raises:
 
 - Kind: `attribute`
 
-- Value: `<built-in method cache_info of functools._lru_cache_wrapper object at 0x7f6bf6175bc0>`
+- Value: `<built-in method cache_info of functools._lru_cache_wrapper object at 0x7f31b5b75bc0>`
 
 Report cache statistics
 
@@ -524,6 +524,6 @@ Report cache statistics
 
 - Kind: `attribute`
 
-- Value: `<built-in method cache_clear of functools._lru_cache_wrapper object at 0x7f6bf6175bc0>`
+- Value: `<built-in method cache_clear of functools._lru_cache_wrapper object at 0x7f31b5b75bc0>`
 
 Clear the cache and cache statistics
