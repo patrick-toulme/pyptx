@@ -11,7 +11,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "pyptx"
-version = "0.1.0"
+version = "0.1.1"
 description = "Python DSL for writing PTX kernels, callable from JAX, PyTorch, and torch.compile"
 requires-python = ">=3.10"
 license = "Apache-2.0"

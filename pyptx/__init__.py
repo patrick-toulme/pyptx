@@ -32,7 +32,7 @@ docstrings in this package, so the module docstrings are intended to
 serve as the high-level entry point into each namespace.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 from pyptx.kernel import kernel
 from pyptx._intrinsic import intrinsic
