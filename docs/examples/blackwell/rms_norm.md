@@ -8,7 +8,7 @@
 Blackwell RMSNorm example using the maintained pyptx kernel path.
 
 Run ``python examples/blackwell/rms_norm.py`` to execute both a ``jax.jit``
-path and a PyTorch eager path on ``sm_100a``.
+path and a PyTorch eager path on ``sm_100``.
 
 ## Source
 
@@ -18,7 +18,7 @@ path and a PyTorch eager path on ``sm_100a``.
     """Blackwell RMSNorm example using the maintained pyptx kernel path.
 
     Run ``python examples/blackwell/rms_norm.py`` to execute both a ``jax.jit``
-    path and a PyTorch eager path on ``sm_100a``.
+    path and a PyTorch eager path on ``sm_100``.
     """
     from __future__ import annotations
 
@@ -41,7 +41,7 @@ path and a PyTorch eager path on ``sm_100a``.
 
 
     def build_rms_norm(B: int, N: int, *, eps: float = 1e-6):
-        return _build_rms_norm(B, N, eps=eps, arch="sm_100a")
+        return _build_rms_norm(B, N, eps=eps, arch="sm_100")
 
 
     def _run_jax_case(B: int, N: int) -> None:

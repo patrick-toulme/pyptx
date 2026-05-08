@@ -8,7 +8,7 @@
 Blackwell SwiGLU example using the maintained pyptx kernel path.
 
 Run ``python examples/blackwell/swiglu.py`` to execute both a ``jax.jit``
-path and a PyTorch eager path on ``sm_100a``.
+path and a PyTorch eager path on ``sm_100``.
 
 ## Source
 
@@ -18,7 +18,7 @@ path and a PyTorch eager path on ``sm_100a``.
     """Blackwell SwiGLU example using the maintained pyptx kernel path.
 
     Run ``python examples/blackwell/swiglu.py`` to execute both a ``jax.jit``
-    path and a PyTorch eager path on ``sm_100a``.
+    path and a PyTorch eager path on ``sm_100``.
     """
     from __future__ import annotations
 
@@ -49,7 +49,7 @@ path and a PyTorch eager path on ``sm_100a``.
     def build_fused_silu_mul(M: int, F: int, *, rows_per_cta: int | None = None):
         if rows_per_cta is None:
             rows_per_cta = _pick_rows_per_cta(M)
-        return _build_fused_silu_mul(M, F, rows_per_cta=rows_per_cta, arch="sm_100a")
+        return _build_fused_silu_mul(M, F, rows_per_cta=rows_per_cta, arch="sm_100")
 
 
     def _run_jax_case(M: int, F: int) -> None:

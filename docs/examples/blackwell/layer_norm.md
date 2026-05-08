@@ -8,7 +8,7 @@
 Blackwell LayerNorm example using the maintained pyptx kernel path.
 
 Run ``python examples/blackwell/layer_norm.py`` to execute both a ``jax.jit``
-path and a PyTorch eager path on ``sm_100a``.
+path and a PyTorch eager path on ``sm_100``.
 
 ## Source
 
@@ -18,7 +18,7 @@ path and a PyTorch eager path on ``sm_100a``.
     """Blackwell LayerNorm example using the maintained pyptx kernel path.
 
     Run ``python examples/blackwell/layer_norm.py`` to execute both a ``jax.jit``
-    path and a PyTorch eager path on ``sm_100a``.
+    path and a PyTorch eager path on ``sm_100``.
     """
     from __future__ import annotations
 
@@ -49,7 +49,7 @@ path and a PyTorch eager path on ``sm_100a``.
     def build_layer_norm(B: int, N: int, *, eps: float = 1e-5, rows_per_cta: int | None = None):
         if rows_per_cta is None:
             rows_per_cta = _pick_rows_per_cta(B)
-        return _build_layer_norm(B, N, eps=eps, rows_per_cta=rows_per_cta, arch="sm_100a")
+        return _build_layer_norm(B, N, eps=eps, rows_per_cta=rows_per_cta, arch="sm_100")
 
 
     def _run_jax_case(B: int, N: int) -> None:
