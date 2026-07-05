@@ -136,7 +136,8 @@ def build_flash_attention_blackwell(
     arch: str = "sm_100a",
     rescale_threshold: float = RESCALE_THRESHOLD,
     emu_pairs: tuple = (1, 3, 5, 7, 9, 11, 13, 15),
-    s_f16: bool = False,
+    s_f16: bool = False,   # experimental fp16 mode; see notes in docstring
+    dbg_f16_noexp: bool = False,
 ):
     assert head_dim == HD, "v1 supports head_dim=128 only"
     assert seqlen % (Q_STAGE * BM) == 0, f"seqlen must be a multiple of 256, got {seqlen}"
@@ -286,8 +287,6 @@ def build_flash_attention_blackwell(
         # MMA dispatch warp (single thread). All operand descriptors are
         # loop-invariant and precomputed into registers.
         # =================================================================
-        S_COLS = 64 if s_f16 else 128   # TMEM columns per S stage
-        TM_S_F = (0, S_COLS)
 
         with ptx.if_(is_mma):
             if s_f16:
@@ -347,7 +346,7 @@ def build_flash_attention_blackwell(
             ]
 
             def qk_mma(stage: int, k_idx: int):
-                d = tmem + TM_S_F[stage] if s_f16 else tmem + TM_S[stage]
+                d = tmem + TM_S[stage]
                 for kk in range(8):
                     ptx.tcgen05.mma(
                         d, desc_q[stage][kk], desc_k[k_idx][kk], idesc_qk,
@@ -378,10 +377,7 @@ def build_flash_attention_blackwell(
                         ph_or[stage] ^= 1
                     ptx.tcgen05.fence_after_thread_sync()
                     for kk in range(4 * half, 4 * half + 4):
-                        if s_f16:
-                            a = tmem + (TM_S_F[stage] + kk * 8)
-                        else:
-                            a = tmem + (TM_P[stage] + kk * 8)
+                        a = tmem + (TM_P[stage] + kk * 8)
                         ptx.tcgen05.mma(
                             d, a, desc_v[v_idx][kk], idesc_pv,
                             kind="f16", a_is_tmem=True,
@@ -484,15 +480,6 @@ def build_flash_attention_blackwell(
             p_addr = [reg.scalar(b32) for _ in range(Q_STAGE)]
             for s in range(Q_STAGE):
                 ptx.inst.mov.b32(s_addr[s], tmem)
-                if s_f16:
-                    # f16 S: 2 elems per column; this half's 64 elems = 32 cols
-                    ptx.inst.add.u32(s_addr[s], s_addr[s], s * 64)
-                    ptx.inst.add.u32(s_addr[s], s_addr[s], lane_addr_bits)
-                    hb = reg.scalar(u32)
-                    ptx.inst.shr.u32(hb, col_base, 1)
-                    ptx.inst.add.u32(s_addr[s], s_addr[s], hb)
-                    ptx.inst.mov.b32(p_addr[s], s_addr[s])  # P in place
-                    continue
                 ptx.inst.add.u32(s_addr[s], s_addr[s], TM_S[s])
                 ptx.inst.add.u32(s_addr[s], s_addr[s], lane_addr_bits)
                 ptx.inst.add.u32(s_addr[s], s_addr[s], col_base)
@@ -556,8 +543,9 @@ def build_flash_attention_blackwell(
                 ptx.inst.xor.b32(ph_s[stage], ph_s[stage], 1)
                 ptx.tcgen05.fence_after_thread_sync()
 
-                pw = [pwb[i] for i in range(32)]  # 32 words = 64 f16 scores
-                ptx.tcgen05.ld(pw, s_addr[stage], shape="32x32b", count=32, dtype="b32")
+                pw = [pwb[i] for i in range(32)]  # 64 f16 scores, packed pairs
+                ptx.tcgen05.ld(pw, s_addr[stage], shape="32x32b", count=32,
+                               dtype="b32", pack=True)
                 ptx.tcgen05.wait_ld()
 
                 # packed max tree over 32 f16x2 words
@@ -920,6 +908,9 @@ def build_flash_attention_blackwell(
                 byte_off = reg.scalar(u64)
                 ptx.inst.mul.wide.u32(byte_off, row, HD * 2)
                 gptr = po + byte_off
+                if dbg_f16_noexp:
+                    # debug build: store raw O (no normalization)
+                    ptx.inst.mov.f32(inv_l, reg.scalar(f32, init=1.0))
 
                 for quarter in range(4):
                     addr = reg.scalar(b32)
@@ -1289,7 +1280,7 @@ def build_flash_attention_blackwell_2cta(
             )
 
             def qk_mma(stage: int, k_idx: int):
-                d = tmem + TM_S_F[stage] if s_f16 else tmem + TM_S[stage]
+                d = tmem + TM_S[stage]
                 for kk in range(8):
                     if debug_mma_level < 1:
                         break
