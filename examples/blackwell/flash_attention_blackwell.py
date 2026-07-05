@@ -1201,9 +1201,14 @@ def build_flash_attention_blackwell(
                 # writes to O during any readout are NOT — the PV(0)
                 # re-arm stays after both stages)
                 ptx.mbarrier.arrive(base + BAR_STATS_FREE + 8 * stage)
-                if dbg_epi_gate and stage == 0:
-                    ptx.mbarrier.arrive(base + BAR_EPI)
 
+              # both stages read out: release the softmax item-start gate
+              # and re-arm the PV(0) gates. Overlapping ANY part of the
+              # readout with softmax TMEM traffic or TC writes to O
+              # corrupts rows (a stage-0-only release still corrupted
+              # ~1/10 runs).
+              if dbg_epi_gate:
+                  ptx.mbarrier.arrive(base + BAR_EPI)
               for s in range(Q_STAGE):
                   ptx.mbarrier.arrive(base + BAR_O_RESC + 16 * s)
 
