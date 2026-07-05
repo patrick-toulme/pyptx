@@ -98,6 +98,22 @@ EX2_C2 = _f32c("3E6906A4")
 EX2_C1 = _f32c("3F31F519")
 EX2_C0 = _f32c("3F800000")
 
+
+def _umma_idesc(m, n, a_fmt, b_fmt, c_fmt, a_major=0, b_major=0):
+    """Blackwell UMMA instruction descriptor (cute mma_sm100_desc layout).
+
+    formats: f16=0, bf16=1 (A/B); c: f16=0, f32=1. majors: K=0, MN=1.
+    """
+    desc = 0
+    desc |= c_fmt << 4
+    desc |= a_fmt << 7
+    desc |= b_fmt << 10
+    desc |= a_major << 15
+    desc |= b_major << 16
+    desc |= (n >> 3) << 17
+    desc |= (m >> 4) << 24
+    return desc
+
 MMA_TID = 384        # warp 12 lane 0
 LOAD_TID = 448       # warp 14 lane 0
 
@@ -120,6 +136,7 @@ def build_flash_attention_blackwell(
     arch: str = "sm_100a",
     rescale_threshold: float = RESCALE_THRESHOLD,
     emu_pairs: tuple = (1, 3, 5, 7, 9, 11, 13, 15),
+    s_f16: bool = False,
 ):
     assert head_dim == HD, "v1 supports head_dim=128 only"
     assert seqlen % (Q_STAGE * BM) == 0, f"seqlen must be a multiple of 256, got {seqlen}"
@@ -129,14 +146,16 @@ def build_flash_attention_blackwell(
         sm_scale = 1.0 / math.sqrt(head_dim)
     qk_scale = sm_scale * LOG2E
     total_rows = batch_heads * seqlen
+    from pyptx.types import f16 as _f16t
+    io_t = _f16t if s_f16 else bf16
 
     @kernel(
         in_specs=(
-            Tile(total_rows, HD, bf16, Layout.TMA_128B, tma_box=(BM, 64)),
-            Tile(total_rows, HD, bf16, Layout.TMA_128B, tma_box=(BN, 64)),
-            Tile(total_rows, HD, bf16, Layout.TMA_128B, tma_box=(BN, 64)),
+            Tile(total_rows, HD, io_t, Layout.TMA_128B, tma_box=(BM, 64)),
+            Tile(total_rows, HD, io_t, Layout.TMA_128B, tma_box=(BN, 64)),
+            Tile(total_rows, HD, io_t, Layout.TMA_128B, tma_box=(BN, 64)),
         ),
-        out_specs=(Tile(total_rows, HD, bf16, Layout.ROW),),
+        out_specs=(Tile(total_rows, HD, io_t, Layout.ROW),),
         grid=(seqlen // (Q_STAGE * BM), batch_heads, 1),
         block=(512, 1, 1),
         arch=arch,
@@ -267,19 +286,30 @@ def build_flash_attention_blackwell(
         # MMA dispatch warp (single thread). All operand descriptors are
         # loop-invariant and precomputed into registers.
         # =================================================================
+        S_COLS = 64 if s_f16 else 128   # TMEM columns per S stage
+        TM_S_F = (0, S_COLS)
+
         with ptx.if_(is_mma):
-            idesc_qk = reg.scalar(
-                b32,
-                init=ptx.tcgen05.make_instr_desc_f16bf16_f32(
-                    m=128, n=BN, ab_dtype="bf16", a_major="K", b_major="K"
-                ),
-            )
-            idesc_pv = reg.scalar(
-                b32,
-                init=ptx.tcgen05.make_instr_desc_f16bf16_f32(
-                    m=128, n=HD, ab_dtype="bf16", a_major="K", b_major="MN"
-                ),
-            )
+            if s_f16:
+                idesc_qk = reg.scalar(
+                    b32, init=_umma_idesc(128, BN, 0, 0, 0, 0, 0)  # f16 in, f16 acc
+                )
+                idesc_pv = reg.scalar(
+                    b32, init=_umma_idesc(128, HD, 0, 0, 1, 0, 1)  # f16 A/B, f32 acc
+                )
+            else:
+                idesc_qk = reg.scalar(
+                    b32,
+                    init=ptx.tcgen05.make_instr_desc_f16bf16_f32(
+                        m=128, n=BN, ab_dtype="bf16", a_major="K", b_major="K"
+                    ),
+                )
+                idesc_pv = reg.scalar(
+                    b32,
+                    init=ptx.tcgen05.make_instr_desc_f16bf16_f32(
+                        m=128, n=HD, ab_dtype="bf16", a_major="K", b_major="MN"
+                    ),
+                )
             p_acc = reg.scalar(pred)
             p_noacc = reg.scalar(pred)
             with ptx.scope():
@@ -317,7 +347,7 @@ def build_flash_attention_blackwell(
             ]
 
             def qk_mma(stage: int, k_idx: int):
-                d = tmem + TM_S[stage]
+                d = tmem + TM_S_F[stage] if s_f16 else tmem + TM_S[stage]
                 for kk in range(8):
                     ptx.tcgen05.mma(
                         d, desc_q[stage][kk], desc_k[k_idx][kk], idesc_qk,
@@ -348,7 +378,10 @@ def build_flash_attention_blackwell(
                         ph_or[stage] ^= 1
                     ptx.tcgen05.fence_after_thread_sync()
                     for kk in range(4 * half, 4 * half + 4):
-                        a = tmem + (TM_P[stage] + kk * 8)
+                        if s_f16:
+                            a = tmem + (TM_S_F[stage] + kk * 8)
+                        else:
+                            a = tmem + (TM_P[stage] + kk * 8)
                         ptx.tcgen05.mma(
                             d, a, desc_v[v_idx][kk], idesc_pv,
                             kind="f16", a_is_tmem=True,
@@ -451,6 +484,15 @@ def build_flash_attention_blackwell(
             p_addr = [reg.scalar(b32) for _ in range(Q_STAGE)]
             for s in range(Q_STAGE):
                 ptx.inst.mov.b32(s_addr[s], tmem)
+                if s_f16:
+                    # f16 S: 2 elems per column; this half's 64 elems = 32 cols
+                    ptx.inst.add.u32(s_addr[s], s_addr[s], s * 64)
+                    ptx.inst.add.u32(s_addr[s], s_addr[s], lane_addr_bits)
+                    hb = reg.scalar(u32)
+                    ptx.inst.shr.u32(hb, col_base, 1)
+                    ptx.inst.add.u32(s_addr[s], s_addr[s], hb)
+                    ptx.inst.mov.b32(p_addr[s], s_addr[s])  # P in place
+                    continue
                 ptx.inst.add.u32(s_addr[s], s_addr[s], TM_S[s])
                 ptx.inst.add.u32(s_addr[s], s_addr[s], lane_addr_bits)
                 ptx.inst.add.u32(s_addr[s], s_addr[s], col_base)
@@ -492,6 +534,7 @@ def build_flash_attention_blackwell(
 
             vals = reg.array(f32, 64)
             packed = reg.array(b32, 16)
+            pwb = reg.array(b32, 32) if s_f16 else None
 
             def tile_max(dst):
                 # 3-input max over the thread's 64 columns
@@ -506,7 +549,131 @@ def build_flash_attention_blackwell(
                 ptx.inst.max.f32(acc[0], acc[0], acc[1], acc[2])
                 ptx.inst.max.f32(dst, acc[0], acc[3])
 
+            from pyptx.types import b16 as _b16
+
+            def body_f16(stage: int, is_first: bool):
+                ptx.mbarrier.wait(base + BAR_S_FULL + 8 * stage, ph_s[stage])
+                ptx.inst.xor.b32(ph_s[stage], ph_s[stage], 1)
+                ptx.tcgen05.fence_after_thread_sync()
+
+                pw = [pwb[i] for i in range(32)]  # 32 words = 64 f16 scores
+                ptx.tcgen05.ld(pw, s_addr[stage], shape="32x32b", count=32, dtype="b32")
+                ptx.tcgen05.wait_ld()
+
+                # packed max tree over 32 f16x2 words
+                acc = [reg.scalar(b32) for _ in range(4)]
+                for a in range(4):
+                    ptx.inst.max.f16x2(acc[a], pw[a], pw[4 + a])
+                for i in range(8, 32, 4):
+                    for a in range(4):
+                        ptx.inst.max.f16x2(acc[a], acc[a], pw[i + a])
+                ptx.inst.max.f16x2(acc[0], acc[0], acc[1])
+                ptx.inst.max.f16x2(acc[2], acc[2], acc[3])
+                ptx.inst.max.f16x2(acc[0], acc[0], acc[2])
+                h0 = reg.scalar(_b16); h1 = reg.scalar(_b16)
+                ptx.inst.mov.b32([h0, h1], acc[0])
+                f0 = reg.scalar(f32); f1 = reg.scalar(f32)
+                ptx.inst.cvt.f32.f16(f0, h0)
+                ptx.inst.cvt.f32.f16(f1, h1)
+                pmax = reg.scalar(f32)
+                ptx.inst.max.f32(pmax, f0, f1)
+
+                # exchange partial maxima with the paired warp
+                ptx.inst.st.shared.b32(ptx.addr(xchg_mine[stage]), pmax)
+                ptx.bar.sync(pair_bar, 64)
+                other = smem.load(b32, ptx.addr(xchg_other[stage]))
+                other_f = reg.scalar(f32)
+                ptx.inst.mov.b32(other_f, other)
+                ptx.inst.max.f32(pmax, pmax, other_f)
+
+                alpha = reg.scalar(f32)
+                if not is_first:
+                    m_new = reg.scalar(f32)
+                    ptx.inst.max.f32(m_new, m_run[stage], pmax)
+                    d = reg.scalar(f32)
+                    ptx.inst.sub.f32(d, m_run[stage], m_new)
+                    ptx.inst.mul.f32(d, d, qk_scale_reg)
+                    keep = reg.scalar(pred)
+                    ptx.inst.setp.ge.f32(keep, d, neg_thresh)
+                    with ptx.if_(keep):
+                        ptx.inst.mov.f32(alpha, one_f)
+                    with ptx.else_():
+                        ptx.inst.ex2.approx.ftz.f32(alpha, d)
+                        ptx.inst.mov.f32(m_run[stage], m_new)
+                    with ptx.if_(is_a):
+                        ptx.mbarrier.wait(
+                            base + BAR_STATS_FREE + 8 * stage, ph_stats[stage]
+                        )
+                        ptx.inst.xor.b32(ph_stats[stage], ph_stats[stage], 1)
+                        ptx.inst.st.shared.b32(ptx.addr(alpha_addr[stage]), alpha)
+                        sb = reg.scalar(u32)
+                        ptx.inst.add.u32(sb, stats_bar0, stage * 4)
+                        ptx.inst.bar.arrive(sb, 64)
+                        needs = reg.scalar(pred)
+                        ptx.inst.setp.lt.f32(needs, alpha, one_f)
+                        blt = reg.scalar(b32)
+                        ptx.inst.vote.sync.ballot.b32(blt, needs, 0xFFFFFFFF)
+                        all_skip = reg.scalar(pred)
+                        ptx.inst.setp.eq.b32(all_skip, blt, 0)
+                        ptx.mbarrier.arrive(base + BAR_O_RESC + 8 * stage, pred=all_skip)
+                else:
+                    ptx.inst.mov.f32(m_run[stage], pmax)
+
+                # packed scale-subtract + exp2: args and results stay f16x2
+                m_scaled = reg.scalar(f32)
+                ptx.inst.mul.f32(m_scaled, m_run[stage], qk_scale_reg)
+                ptx.inst.neg.f32(m_scaled, m_scaled)
+                mh = reg.scalar(_b16)
+                ptx.inst.cvt.rn.f16.f32(mh, m_scaled)
+                m2h = reg.scalar(b32)
+                ptx.inst.mov.b32(m2h, [mh, mh])
+                qh = reg.scalar(_b16)
+                ptx.inst.cvt.rn.f16.f32(qh, qk_scale_reg)
+                q2h = reg.scalar(b32)
+                ptx.inst.mov.b32(q2h, [qh, qh])
+                for i in range(32):
+                    ptx.inst.fma.rn.f16x2(pw[i], pw[i], q2h, m2h)
+                    ptx.inst.ex2.approx.f16x2(pw[i], pw[i])
+                # P = exp'd f16 pairs, stored in place over S
+                ptx.tcgen05.st(p_addr[stage], pw, shape="32x32b", count=32, dtype="b32")
+                ptx.tcgen05.wait_st()
+                ptx.tcgen05.fence_before_thread_sync()
+                qbar = reg.scalar(u32)
+                ptx.inst.shr.u32(qbar, col_base, 2)  # 0 (A) or 16 (B)
+                ptx.inst.add.u32(qbar, qbar, base + BAR_P_Q + 32 * stage)
+                ptx.mbarrier.arrive(qbar)
+
+                # row sum: one f16x2 pair-add level, then f32 tree
+                sacc = [reg.scalar(b32) for _ in range(4)]
+                for a in range(4):
+                    ptx.inst.add.rn.f16x2(sacc[a], pw[a], pw[4 + a])
+                for i in range(8, 32, 4):
+                    for a in range(4):
+                        ptx.inst.add.rn.f16x2(sacc[a], sacc[a], pw[i + a])
+                ptx.inst.add.rn.f16x2(sacc[0], sacc[0], sacc[1])
+                ptx.inst.add.rn.f16x2(sacc[2], sacc[2], sacc[3])
+                sh0 = reg.scalar(_b16); sh1 = reg.scalar(_b16)
+                sh2 = reg.scalar(_b16); sh3 = reg.scalar(_b16)
+                ptx.inst.mov.b32([sh0, sh1], sacc[0])
+                ptx.inst.mov.b32([sh2, sh3], sacc[2])
+                sf = [reg.scalar(f32) for _ in range(4)]
+                ptx.inst.cvt.f32.f16(sf[0], sh0)
+                ptx.inst.cvt.f32.f16(sf[1], sh1)
+                ptx.inst.cvt.f32.f16(sf[2], sh2)
+                ptx.inst.cvt.f32.f16(sf[3], sh3)
+                sums = reg.scalar(f32)
+                ptx.inst.add.f32(sf[0], sf[0], sf[1])
+                ptx.inst.add.f32(sf[2], sf[2], sf[3])
+                ptx.inst.add.f32(sums, sf[0], sf[2])
+                if is_first:
+                    ptx.inst.mov.f32(l_run[stage], sums)
+                else:
+                    ptx.inst.fma.rn.f32(l_run[stage], l_run[stage], alpha, sums)
+
             def body(stage: int, is_first: bool):
+                if s_f16:
+                    body_f16(stage, is_first)
+                    return
                 ptx.mbarrier.wait(base + BAR_S_FULL + 8 * stage, ph_s[stage])
                 ptx.inst.xor.b32(ph_s[stage], ph_s[stage], 1)
                 ptx.tcgen05.fence_after_thread_sync()
@@ -1122,7 +1289,7 @@ def build_flash_attention_blackwell_2cta(
             )
 
             def qk_mma(stage: int, k_idx: int):
-                d = tmem + TM_S[stage]
+                d = tmem + TM_S_F[stage] if s_f16 else tmem + TM_S[stage]
                 for kk in range(8):
                     if debug_mma_level < 1:
                         break
