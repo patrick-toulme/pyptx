@@ -83,8 +83,9 @@ BAR_STATS_FREE = SMEM_BARS + 200  # 2 x 8
 BAR_PV_DONE = SMEM_BARS + 216     # 2 x 8
 BAR_Q_FREE = SMEM_BARS + 232      # 8 (persistent: Q smem free for next work item)
 BAR_ITER = SMEM_BARS + 248        # 8 (dbg_lockstep only)
+BAR_EPI = SMEM_BARS + 256         # 8 (dbg_epi_gate bisection aid)
 SMEM_TMEM_SLOT = SMEM_BARS + 240
-SMEM_BYTES = SMEM_TMEM_SLOT + 16
+SMEM_BYTES = BAR_EPI + 8
 
 # TMEM columns
 TM_S = (0, 128)
@@ -150,14 +151,16 @@ def build_flash_attention_blackwell(
     dbg_f16_noexp: bool = False,
     waitmap: bool = False,
     num_sms: int = 148,
-    # Cross-work-item overlap policy. The compute roles (softmax,
-    # correction, mma) synchronize at each work-item boundary; the load
-    # warp runs free so the next item's Q/KV TMA overlaps the current
-    # tail + epilogue. Fully free-running compute roles are measurably
-    # faster on paper but the mbarrier parity waits tolerate at most one
-    # phase of lag, and a lagging correction group corrupts single rows
-    # (~1e-2 rate); True locks all four roles, "no_<role>" releases one.
-    dbg_lockstep="no_load",
+    # Work items overlap freely across all roles, with ONE cross-item
+    # gate: the softmax pool's item start waits for the previous
+    # epilogue's O readout (BAR_EPI). Without it, the softmax warps'
+    # TMEM loads/stores concurrently with the epilogue's O reads corrupt
+    # single rows (~1e-2 rate, stage 1) — a pairing the mainloop never
+    # exercises since only rescale tiles read O there. dbg_lockstep=True
+    # (or "no_<role>") additionally locks roles at item boundaries for
+    # bisection; dbg_epi_gate="mma" moves the gate to the MMA warp.
+    dbg_lockstep=False,
+    dbg_epi_gate="softmax",
 ):
     assert head_dim == HD, "v1 supports head_dim=128 only"
     assert seqlen % (Q_STAGE * BM) == 0, f"seqlen must be a multiple of 256, got {seqlen}"
@@ -289,6 +292,9 @@ def build_flash_attention_blackwell(
             ptx.mbarrier.init(base + BAR_Q_FREE, 1)
             if dbg_lockstep:
                 ptx.mbarrier.init(base + BAR_ITER, lock_count)
+            if dbg_epi_gate:
+                # arrived by the 128 correction threads per epilogue
+                ptx.mbarrier.init(base + BAR_EPI, 128)
             ptx.fence.proxy_async_shared_cta()
         with ptx.if_(alloc_warp):
             ptx.tcgen05.alloc(base + SMEM_TMEM_SLOT, 512)
@@ -494,7 +500,12 @@ def build_flash_attention_blackwell(
             mw = reg.scalar(u32); ptx.inst.mov.u32(mw, cta_id)
             mgo = reg.scalar(pred)
             ptx.inst.setp.lt.u32(mgo, mw, total_work)
+            if dbg_epi_gate == "mma":
+                epi_ph = reg.scalar(b32, init=0)
             with ptx.loop("mma_work_loop", pred=mgo):
+                if dbg_epi_gate == "mma":
+                    ptx.mbarrier.wait(base + BAR_EPI, epi_ph)
+                    ptx.inst.xor.b32(epi_ph, epi_ph, 1)
                 # ---- prologue: S(0) for stage 0 as soon as Q0+K0 land;
                 # the second Q tile's TMA overlaps the first QK ----
                 ptx.mbarrier.wait(base + BAR_Q + 0, ph_qa)
@@ -973,7 +984,12 @@ def build_flash_attention_blackwell(
             sw = reg.scalar(u32); ptx.inst.mov.u32(sw, cta_id)
             sgo = reg.scalar(pred)
             ptx.inst.setp.lt.u32(sgo, sw, total_work)
+            if dbg_epi_gate == "softmax":
+                epi_ph = reg.scalar(b32, init=0)
             with ptx.loop("softmax_work_loop", pred=sgo):
+                if dbg_epi_gate == "softmax":
+                    ptx.mbarrier.wait(base + BAR_EPI, epi_ph)
+                    ptx.inst.xor.b32(epi_ph, epi_ph, 1)
                 for s in range(Q_STAGE):
                     ptx.inst.mov.f32(mneg[s], zero_f)
                     ptx.inst.mov.f32(l_run[s], zero_f)
@@ -1049,6 +1065,8 @@ def build_flash_attention_blackwell(
             for s in range(Q_STAGE):
                 ptx.mbarrier.arrive(base + BAR_O_RESC + 16 * s)
                 ptx.mbarrier.arrive(base + BAR_STATS_FREE + 8 * s)
+            if dbg_epi_gate:
+                ptx.mbarrier.arrive(base + BAR_EPI)
 
             ovals = reg.array(f32, 64)
             ph_pv = [reg.scalar(b32, init=0) for _ in range(Q_STAGE)]
@@ -1118,6 +1136,12 @@ def build_flash_attention_blackwell(
                   ptx.mbarrier.wait(base + BAR_PV_DONE + 8 * stage, ph_pv[stage])
                   ptx.inst.xor.b32(ph_pv[stage], ph_pv[stage], 1)
 
+              # arrive the work-item boundary BEFORE the epilogue: the
+              # DRAM-bound O readout then overlaps the next item's QK and
+              # softmax, while the next PV(0) stays gated on the
+              # post-epilogue O_RESC re-arm
+              iter_sync(citer_ph, "corr")
+
               # ---- epilogue: wait all PV done, normalize, store bf16 ----
               ptx.mbarrier.wait(base + BAR_O_DONE, done_phase)
               ptx.inst.xor.b32(done_phase, done_phase, 1)
@@ -1131,9 +1155,6 @@ def build_flash_attention_blackwell(
                 ptx.bar.sync(stats_bar[stage], 64)
                 la = smem.load(b32, ptx.addr(alpha_addr[stage] + 1024))
                 lb = smem.load(b32, ptx.addr(alpha_addr[stage] + 2048))
-                # return the final publish's credit; it becomes the next
-                # work item's standing STATS_FREE credit
-                ptx.mbarrier.arrive(base + BAR_STATS_FREE + 8 * stage)
                 l = reg.scalar(f32)
                 laf = reg.scalar(f32); lbf = reg.scalar(f32)
                 ptx.inst.mov.b32(laf, la)
@@ -1168,14 +1189,19 @@ def build_flash_attention_blackwell(
                             ptx.addr(gptr, quarter * 64 + vec * 16),
                             [opacked[vec * 4 + k] for k in range(4)],
                         )
+                # return the final publish's credit only after this
+                # stage's O is fully read out; it becomes the next work
+                # item's standing STATS_FREE credit
+                ptx.mbarrier.arrive(base + BAR_STATS_FREE + 8 * stage)
 
               # O has been read out: re-arm the next work item's PV(0)
               # gate (O_RESC parity 0) — the fresh accumulation must not
               # start before the epilogue read above
               for s in range(Q_STAGE):
                   ptx.mbarrier.arrive(base + BAR_O_RESC + 16 * s)
+              if dbg_epi_gate:
+                  ptx.mbarrier.arrive(base + BAR_EPI)
 
-              iter_sync(citer_ph, "corr")
               ptx.inst.add.u32(cw, cw, num_ctas)
               ptx.inst.setp.lt.u32(cgo, cw, total_work)
 
