@@ -990,6 +990,18 @@ def build_flash_attention_blackwell(
                     ptx.inst.add.u32(addr, o_addr[stage], half * 64)
                     ptx.tcgen05.ld(ovals, addr, shape="32x32b", count=64, dtype="b32")
                     ptx.tcgen05.wait_ld()
+                    if stage == 1 and half == 1:
+                        # the LAST TMEM read is complete: everything the
+                        # gates protect (the readout — TC writes to O or
+                        # softmax TMEM traffic during it corrupt rows) is
+                        # done, and the remaining normalize/pack/store is
+                        # register->global work. Release the next item
+                        # now so it overlaps the store tail.
+                        ptx.mbarrier.arrive(base + BAR_STATS_FREE + 8)
+                        if dbg_epi_gate:
+                            ptx.mbarrier.arrive(base + BAR_EPI)
+                        for s in range(Q_STAGE):
+                            ptx.mbarrier.arrive(base + BAR_O_RESC + 16 * s)
                     for i in range(64):
                         ptx.inst.mul.f32(ovals[i], ovals[i], inv_l)
                     for q in range(2):
@@ -1010,23 +1022,9 @@ def build_flash_attention_blackwell(
                                 ptx.addr(gptr, half * 128 + q * 64 + vec * 16),
                                 [opacked[vec * 4 + k] for k in range(4)],
                             )
-                # this stage's O is fully read out: return the final
-                # publish's credit (next item's standing STATS_FREE
-                # credit) and release the softmax item-start gate after
-                # stage 0 (overlapping the stage-1 readout is safe; TC
-                # writes to O during any readout are NOT — the PV(0)
-                # re-arm stays after both stages)
-                ptx.mbarrier.arrive(base + BAR_STATS_FREE + 8 * stage)
-
-              # both stages read out: release the softmax item-start gate
-              # and re-arm the PV(0) gates. Overlapping ANY part of the
-              # readout with softmax TMEM traffic or TC writes to O
-              # corrupts rows (a stage-0-only release still corrupted
-              # ~1/10 runs).
-              if dbg_epi_gate:
-                  ptx.mbarrier.arrive(base + BAR_EPI)
-              for s in range(Q_STAGE):
-                  ptx.mbarrier.arrive(base + BAR_O_RESC + 16 * s)
+                if stage == 0:
+                    # stage-0 sums slot consumed: return the credit
+                    ptx.mbarrier.arrive(base + BAR_STATS_FREE)
 
               ptx.inst.add.u32(cw, cw, num_ctas)
               ptx.inst.setp.lt.u32(cgo, cw, total_work)
