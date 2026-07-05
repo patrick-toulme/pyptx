@@ -598,10 +598,7 @@ def build_flash_attention_blackwell(
         # =================================================================
         with ptx.if_(is_softmax):
             ptx.setmaxnreg(NREG_SOFTMAX, inc=True)
-            if s_f16:
-                raise NotImplementedError(
-                    "s_f16 predates the streaming softmax (see git history)"
-                )
+            from pyptx.types import b16 as _b16
 
             stage_b = reg.scalar(u32)            # this warpgroup's Q stage
             ptx.inst.and_.b32(stage_b, tid, 128)
@@ -675,8 +672,21 @@ def build_flash_attention_blackwell(
             ph_s = reg.scalar(b32, init=0)
             ph_stats = reg.scalar(b32, init=0)
 
-            bufs = (reg.array(f32, 32), reg.array(f32, 32))
-            pk = reg.array(b32, 16)
+            if s_f16:
+                # packed f16x2: a 64-column chunk is 32 registers, so the
+                # tile streams in TWO double-buffered chunks — half the
+                # load cadence of the f32 path (which can't afford 64-col
+                # buffers in registers)
+                pwb = (reg.array(b32, 32), reg.array(b32, 32))
+                qh16 = reg.scalar(_b16)
+                ptx.inst.cvt.rn.f16.f32(qh16, qk_scale_reg)
+                q2h = reg.scalar(b32)
+                ptx.inst.mov.b32(q2h, [qh16, qh16])
+                macc16 = [reg.scalar(b32) for _ in range(4)]
+                sacc16 = [reg.scalar(b32) for _ in range(4)]
+            else:
+                bufs = (reg.array(f32, 32), reg.array(f32, 32))
+                pk = reg.array(b32, 16)
             macc = [reg.scalar(f32) for _ in range(4)]
             sacc = [reg.scalar(f32) for _ in range(4)]
 
@@ -747,7 +757,13 @@ def build_flash_attention_blackwell(
                 # first chunk's load flies under the deferred tail
                 a0 = reg.scalar(b32)
                 ptx.inst.mov.b32(a0, sp_base)
-                ptx.tcgen05.ld(bufs[0], a0, shape="32x32b", count=32, dtype="b32")
+                if s_f16:
+                    # 64 unpacked f16-D columns -> 32 packed registers
+                    ptx.tcgen05.ld([pwb[0][i] for i in range(32)], a0,
+                                   shape="32x32b", count=32, dtype="b32",
+                                   pack=True)
+                else:
+                    ptx.tcgen05.ld(bufs[0], a0, shape="32x32b", count=32, dtype="b32")
 
                 if not is_first:
                     # ---- deferred tail of tile k-1: basis decision from
@@ -786,6 +802,79 @@ def build_flash_attention_blackwell(
 
                 if emu_pairs:
                     ptx.inst.mov.b64(m2, [mneg, mneg])
+
+                if s_f16:
+                    # ---- stream 2 half-tile chunks (64 packed cols) ----
+                    mh = reg.scalar(_b16)
+                    ptx.inst.cvt.rn.f16.f32(mh, mneg)
+                    m2h = reg.scalar(b32)
+                    ptx.inst.mov.b32(m2h, [mh, mh])
+                    for c in range(2):
+                        ptx.tcgen05.wait_ld()
+                        if c < 1:
+                            an = reg.scalar(b32)
+                            ptx.inst.add.u32(an, sp_base, 64)
+                            ptx.tcgen05.ld([pwb[1][i] for i in range(32)], an,
+                                           shape="32x32b", count=32,
+                                           dtype="b32", pack=True)
+                        w = pwb[c & 1]
+                        for i in range(32):
+                            ptx.inst.fma.rn.f16x2(w[i], w[i], q2h, m2h)
+                            ptx.inst.ex2.approx.f16x2(w[i], w[i])
+                        # results are already packed pairs: store directly
+                        pa = reg.scalar(b32)
+                        ptx.inst.add.u32(pa, sp_base, c * 32)
+                        ptx.tcgen05.st(pa, [w[i] for i in range(32)],
+                                       shape="32x32b", count=32, dtype="b32")
+                        ptx.tcgen05.wait_st()
+                        ptx.tcgen05.fence_before_thread_sync()
+                        # this chunk is a HALF: arrive both of its quarter
+                        # barriers so the consumer stays quarter-granular
+                        for qq in (2 * c, 2 * c + 1):
+                            qb = reg.scalar(u32)
+                            ptx.inst.add.u32(qb, pq_ad, 8 * qq)
+                            ptx.mbarrier.arrive(qb)
+                        # fold into running f16x2 max/sum accs
+                        for a in range(4):
+                            t = reg.scalar(b32)
+                            ptx.inst.max.f16x2(t, w[a], w[4 + a])
+                            for i in range(8, 32, 4):
+                                ptx.inst.max.f16x2(t, t, w[i + a])
+                            if c == 0:
+                                ptx.inst.mov.b32(macc16[a], t)
+                            else:
+                                ptx.inst.max.f16x2(macc16[a], macc16[a], t)
+                            s = reg.scalar(b32)
+                            ptx.inst.add.rn.f16x2(s, w[a], w[4 + a])
+                            for i in range(8, 32, 4):
+                                ptx.inst.add.rn.f16x2(s, s, w[i + a])
+                            if c == 0:
+                                ptx.inst.mov.b32(sacc16[a], s)
+                            else:
+                                ptx.inst.add.rn.f16x2(sacc16[a], sacc16[a], s)
+
+                    # horizontal reduce (f16x2 -> f32 pending carries)
+                    ptx.inst.max.f16x2(macc16[0], macc16[0], macc16[1])
+                    ptx.inst.max.f16x2(macc16[2], macc16[2], macc16[3])
+                    ptx.inst.max.f16x2(macc16[0], macc16[0], macc16[2])
+                    h0 = reg.scalar(_b16); h1 = reg.scalar(_b16)
+                    ptx.inst.mov.b32([h0, h1], macc16[0])
+                    f0 = reg.scalar(f32); f1 = reg.scalar(f32)
+                    ptx.inst.cvt.f32.f16(f0, h0)
+                    ptx.inst.cvt.f32.f16(f1, h1)
+                    ptx.inst.max.f32(pmax_pend, f0, f1)
+                    ptx.inst.add.rn.f16x2(sacc16[0], sacc16[0], sacc16[1])
+                    ptx.inst.add.rn.f16x2(sacc16[2], sacc16[2], sacc16[3])
+                    sh = [reg.scalar(_b16) for _ in range(4)]
+                    ptx.inst.mov.b32([sh[0], sh[1]], sacc16[0])
+                    ptx.inst.mov.b32([sh[2], sh[3]], sacc16[2])
+                    sf = [reg.scalar(f32) for _ in range(4)]
+                    for k in range(4):
+                        ptx.inst.cvt.f32.f16(sf[k], sh[k])
+                    ptx.inst.add.f32(sf[0], sf[0], sf[1])
+                    ptx.inst.add.f32(sf[2], sf[2], sf[3])
+                    ptx.inst.add.f32(sums_pend, sf[0], sf[2])
+                    return
 
                 # ---- stream 4 chunks: ld(c+1) flies under exp/store(c) --
                 for c in range(4):
