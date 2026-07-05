@@ -81,7 +81,9 @@ BAR_O_RESC = SMEM_BARS + 160      # 2 stages x 2 parities x 8
 BAR_O_DONE = SMEM_BARS + 192      # 8
 BAR_STATS_FREE = SMEM_BARS + 200  # 2 x 8
 BAR_PV_DONE = SMEM_BARS + 216     # 2 x 8
-SMEM_TMEM_SLOT = SMEM_BARS + 232
+BAR_Q_FREE = SMEM_BARS + 232      # 8 (persistent: Q smem free for next work item)
+BAR_ITER = SMEM_BARS + 248        # 8 (dbg_lockstep only)
+SMEM_TMEM_SLOT = SMEM_BARS + 240
 SMEM_BYTES = SMEM_TMEM_SLOT + 16
 
 # TMEM columns
@@ -147,6 +149,15 @@ def build_flash_attention_blackwell(
     s_f16: bool = False,   # experimental fp16 mode; see notes in docstring
     dbg_f16_noexp: bool = False,
     waitmap: bool = False,
+    num_sms: int = 148,
+    # Cross-work-item overlap policy. The compute roles (softmax,
+    # correction, mma) synchronize at each work-item boundary; the load
+    # warp runs free so the next item's Q/KV TMA overlaps the current
+    # tail + epilogue. Fully free-running compute roles are measurably
+    # faster on paper but the mbarrier parity waits tolerate at most one
+    # phase of lag, and a lagging correction group corrupts single rows
+    # (~1e-2 rate); True locks all four roles, "no_<role>" releases one.
+    dbg_lockstep="no_load",
 ):
     assert head_dim == HD, "v1 supports head_dim=128 only"
     assert seqlen % (Q_STAGE * BM) == 0, f"seqlen must be a multiple of 256, got {seqlen}"
@@ -159,6 +170,15 @@ def build_flash_attention_blackwell(
     from pyptx.types import f16 as _f16t
     io_t = _f16t if s_f16 else bf16
 
+    # persistent scheduling: one wave of CTAs, each looping over
+    # (m_block, bh) work items. m_block varies fastest so consecutive
+    # CTAs share K/V in L2.
+    n_mblocks = seqlen // (Q_STAGE * BM)
+    assert n_mblocks & (n_mblocks - 1) == 0, "n_mblocks must be a power of 2"
+    mb_shift = n_mblocks.bit_length() - 1
+    total_work = n_mblocks * batch_heads
+    num_ctas = min(total_work, num_sms)
+
     from pyptx.debugkit import WAITMAP_MAX_SITES, WaitMap
     wm = WaitMap() if waitmap else None
 
@@ -168,7 +188,7 @@ def build_flash_attention_blackwell(
             Tile(total_rows, HD, io_t, Layout.TMA_128B, tma_box=(BN, 64)),
             Tile(total_rows, HD, io_t, Layout.TMA_128B, tma_box=(BN, 64)),
         ),
-        grid=(seqlen // (Q_STAGE * BM), batch_heads, 1),
+        grid=(num_ctas, 1, 1),
         block=(512, 1, 1),
         arch=arch,
         smem=SMEM_BYTES,
@@ -185,8 +205,7 @@ def build_flash_attention_blackwell(
     def _fa_body(Q, K, V, O, WM=None):
         base = smem.base()
         tid = reg.scalar(u32); ptx.inst.mov.u32(tid, ptx.special.tid.x())
-        m_block = reg.scalar(u32); ptx.inst.mov.u32(m_block, ptx.special.ctaid.x())
-        bh = reg.scalar(u32); ptx.inst.mov.u32(bh, ptx.special.ctaid.y())
+        cta_id = reg.scalar(u32); ptx.inst.mov.u32(cta_id, ptx.special.ctaid.x())
         if waitmap:
             (pwm,) = ptx.global_ptrs(WM)
             wm.attach(pwm, tid)
@@ -214,15 +233,43 @@ def build_flash_attention_blackwell(
         alloc_warp = reg.scalar(pred)
         ptx.inst.setp.eq.u32(alloc_warp, warp, 12)
 
-        # Global row bases: Q rows for this CTA, KV rows for this (batch,head).
-        q_row0 = reg.scalar(u32)
-        ptx.inst.mul.lo.u32(q_row0, bh, seqlen)
-        kv_row0 = reg.scalar(u32)
-        ptx.inst.mov.u32(kv_row0, q_row0)
-        with ptx.scope():
-            mb_rows = reg.scalar(u32)
-            ptx.inst.mul.lo.u32(mb_rows, m_block, Q_STAGE * BM)
-            ptx.inst.add.u32(q_row0, q_row0, mb_rows)
+        # dbg_lockstep: participating roles arrive/wait this barrier at
+        # the end of each work item, serializing cross-item overlap.
+        # dbg_lockstep=True locks all four roles; "no_<role>" releases one
+        # (bisection aid).
+        lock_roles = set()
+        if dbg_lockstep:
+            lock_roles = {"softmax", "corr", "mma", "load"}
+            if isinstance(dbg_lockstep, str) and dbg_lockstep.startswith("no_"):
+                lock_roles.discard(dbg_lockstep[3:])
+        lock_count = (
+            256 * ("softmax" in lock_roles) + 128 * ("corr" in lock_roles)
+            + ("mma" in lock_roles) + ("load" in lock_roles)
+        )
+
+        def iter_sync(ph, role):
+            if role not in lock_roles:
+                return
+            ptx.mbarrier.arrive(base + BAR_ITER)
+            ptx.mbarrier.wait(base + BAR_ITER, ph)
+            ptx.inst.xor.b32(ph, ph, 1)
+
+        # Per-work-item Q/KV row bases, derived from a linear work id.
+        # m_block = w & (n_mblocks-1), bh = w >> mb_shift.
+        def derive_rows(w, want_kv: bool):
+            q_row = reg.scalar(u32)
+            kv_row = reg.scalar(u32) if want_kv else None
+            with ptx.scope():
+                mb = reg.scalar(u32)
+                ptx.inst.and_.b32(mb, w, n_mblocks - 1)
+                bhw = reg.scalar(u32)
+                ptx.inst.shr.u32(bhw, w, mb_shift)
+                ptx.inst.mul.lo.u32(q_row, bhw, seqlen)
+                if want_kv:
+                    ptx.inst.mov.u32(kv_row, q_row)
+                ptx.inst.mul.lo.u32(mb, mb, Q_STAGE * BM)
+                ptx.inst.add.u32(q_row, q_row, mb)
+            return q_row, kv_row
 
         # ---- init barriers, allocate TMEM ----
         with ptx.if_(tid == 0):
@@ -239,6 +286,9 @@ def build_flash_attention_blackwell(
                 ptx.mbarrier.init(base + BAR_KV_FULL + 8 * s, 1)
                 ptx.mbarrier.init(base + BAR_KV_FREE + 8 * s, 1)
             ptx.mbarrier.init(base + BAR_O_DONE, 1)
+            ptx.mbarrier.init(base + BAR_Q_FREE, 1)
+            if dbg_lockstep:
+                ptx.mbarrier.init(base + BAR_ITER, lock_count)
             ptx.fence.proxy_async_shared_cta()
         with ptx.if_(alloc_warp):
             ptx.tcgen05.alloc(base + SMEM_TMEM_SLOT, 512)
@@ -271,43 +321,63 @@ def build_flash_attention_blackwell(
                         mbar=base + mbar_off,
                     )
 
-            q_row1 = reg.scalar(u32)
-            ptx.inst.add.u32(q_row1, q_row0, BM)
-            ptx.mbarrier.arrive_expect_tx(base + BAR_Q + 0, TILE_BYTES)
-            load_tile(SMEM_Q, Q, q_row0, BAR_Q + 0)
-            ptx.mbarrier.arrive_expect_tx(base + BAR_Q + 8, TILE_BYTES)
-            load_tile(SMEM_Q + TILE_BYTES, Q, q_row1, BAR_Q + 8)
-
-            krow = reg.scalar(u32); ptx.inst.mov.u32(krow, kv_row0)
-            vrow = reg.scalar(u32); ptx.inst.mov.u32(vrow, kv_row0)
+            # self-credit the ring and the Q buffer once: every load below
+            # (including each work item's prologue) waits FREE first, so
+            # the accounting is uniform across persistent iterations
+            for s in range(KV_SLOTS):
+                ptx.mbarrier.arrive(base + BAR_KV_FREE + 8 * s)
+            ptx.mbarrier.arrive(base + BAR_Q_FREE)
+            free_phase = [reg.scalar(b32, init=0) for _ in range(KV_SLOTS)]
+            q_free_phase = reg.scalar(b32, init=0)
 
             def load_kv(slot: int, tensor, row_reg):
+                ptx.mbarrier.wait(base + BAR_KV_FREE + 8 * slot, free_phase[slot])
+                free_phase[slot] ^= 1
                 ptx.mbarrier.arrive_expect_tx(base + BAR_KV_FULL + 8 * slot, TILE_BYTES)
                 load_tile(SMEM_KV + slot * TILE_BYTES, tensor, row_reg, BAR_KV_FULL + 8 * slot)
                 ptx.inst.add.u32(row_reg, row_reg, BN)
 
-            # prologue: fill the ring (K0 V0 K1 V1)
-            load_kv(0, K, krow)
-            load_kv(1, V, vrow)
-            load_kv(2, K, krow)
-            load_kv(3, V, vrow)
+            lw = reg.scalar(u32); ptx.inst.mov.u32(lw, cta_id)
+            lgo = reg.scalar(pred)
+            liter_ph = reg.scalar(b32, init=0)
+            ptx.inst.setp.lt.u32(lgo, lw, total_work)
+            with ptx.loop("load_work_loop", pred=lgo):
+                q_row0, kv_row0 = derive_rows(lw, want_kv=True)
+                q_row1 = reg.scalar(u32)
+                ptx.inst.add.u32(q_row1, q_row0, BM)
+                krow = reg.scalar(u32); ptx.inst.mov.u32(krow, kv_row0)
+                vrow = reg.scalar(u32); ptx.inst.mov.u32(vrow, kv_row0)
 
-            # steady state: 4 loads per trip into slots 0..3
-            trips = (n_tiles - 2) // 2
-            if trips > 0:
-                free_phase = [reg.scalar(b32, init=0) for _ in range(KV_SLOTS)]
-                trip = reg.scalar(u32, init=0)
-                go = reg.scalar(pred)
-                ptx.inst.setp.lt.u32(go, trip, trips)
-                with ptx.loop("kv_load_loop", pred=go):
-                    for slot, tensor, row_reg in (
-                        (0, K, krow), (1, V, vrow), (2, K, krow), (3, V, vrow),
-                    ):
-                        ptx.mbarrier.wait(base + BAR_KV_FREE + 8 * slot, free_phase[slot])
-                        free_phase[slot] ^= 1
-                        load_kv(slot, tensor, row_reg)
-                    trip += 1
+                # prologue, ordered by first use: QK(stage 0) needs only
+                # Q0+K0, so K0 goes ahead of the second Q tile
+                ptx.mbarrier.wait(base + BAR_Q_FREE, q_free_phase)
+                ptx.inst.xor.b32(q_free_phase, q_free_phase, 1)
+                ptx.mbarrier.arrive_expect_tx(base + BAR_Q + 0, TILE_BYTES)
+                load_tile(SMEM_Q, Q, q_row0, BAR_Q + 0)
+                load_kv(0, K, krow)
+                ptx.mbarrier.arrive_expect_tx(base + BAR_Q + 8, TILE_BYTES)
+                load_tile(SMEM_Q + TILE_BYTES, Q, q_row1, BAR_Q + 8)
+                load_kv(1, V, vrow)
+                load_kv(2, K, krow)
+                load_kv(3, V, vrow)
+
+                # steady state: 4 loads per trip into slots 0..3
+                trips = (n_tiles - 2) // 2
+                if trips > 0:
+                    trip = reg.scalar(u32, init=0)
+                    go = reg.scalar(pred)
                     ptx.inst.setp.lt.u32(go, trip, trips)
+                    with ptx.loop("kv_load_loop", pred=go):
+                        for slot, tensor, row_reg in (
+                            (0, K, krow), (1, V, vrow), (2, K, krow), (3, V, vrow),
+                        ):
+                            load_kv(slot, tensor, row_reg)
+                        trip += 1
+                        ptx.inst.setp.lt.u32(go, trip, trips)
+
+                iter_sync(liter_ph, "load")
+                ptx.inst.add.u32(lw, lw, num_ctas)
+                ptx.inst.setp.lt.u32(lgo, lw, total_work)
 
         # =================================================================
         # MMA dispatch warp (single thread). All operand descriptors are
@@ -418,64 +488,83 @@ def build_flash_attention_blackwell(
                 # after this tile's PV has fully accumulated
                 ptx.tcgen05.commit(base + BAR_PV_DONE + 8 * stage)
 
-            # ---- prologue: Q ready, K0 ready -> S(0) both stages ----
             ph_qa = reg.scalar(b32, init=0)
             ph_qb = reg.scalar(b32, init=0)
-            ptx.mbarrier.wait(base + BAR_Q + 0, ph_qa)
-            ptx.mbarrier.wait(base + BAR_Q + 8, ph_qb)
-            wait_kv(0)
-            qk_mma(0, 0)
-            qk_mma(1, 0)
-            ptx.tcgen05.commit(base + BAR_KV_FREE + 0)
+            miter_ph = reg.scalar(b32, init=0)
+            mw = reg.scalar(u32); ptx.inst.mov.u32(mw, cta_id)
+            mgo = reg.scalar(pred)
+            ptx.inst.setp.lt.u32(mgo, mw, total_work)
+            with ptx.loop("mma_work_loop", pred=mgo):
+                # ---- prologue: S(0) for stage 0 as soon as Q0+K0 land;
+                # the second Q tile's TMA overlaps the first QK ----
+                ptx.mbarrier.wait(base + BAR_Q + 0, ph_qa)
+                ptx.inst.xor.b32(ph_qa, ph_qa, 1)
+                wait_kv(0)
+                qk_mma(0, 0)
+                ptx.mbarrier.wait(base + BAR_Q + 8, ph_qb)
+                ptx.inst.xor.b32(ph_qb, ph_qb, 1)
+                qk_mma(1, 0)
+                ptx.tcgen05.commit(base + BAR_KV_FREE + 0)
 
-            # ---- peeled j=0: PV(0) with V slot 1, then S(1) with K slot 2 ----
-            wait_kv(1)
-            pv_mma(0, 0, first_accum=True, par=0)
-            wait_kv(2)
-            qk_mma(0, 1)
-            pv_mma(1, 0, first_accum=True, par=0)
-            qk_mma(1, 1)
-            ptx.tcgen05.commit(base + BAR_KV_FREE + 8 * 2)
-            ptx.tcgen05.commit(base + BAR_KV_FREE + 8 * 1)
+                # ---- peeled j=0: PV(0) with V slot 1, S(1) with K slot 2 ----
+                wait_kv(1)
+                pv_mma(0, 0, first_accum=True, par=0)
+                wait_kv(2)
+                qk_mma(0, 1)
+                pv_mma(1, 0, first_accum=True, par=0)
+                qk_mma(1, 1)
+                ptx.tcgen05.commit(base + BAR_KV_FREE + 8 * 2)
+                ptx.tcgen05.commit(base + BAR_KV_FREE + 8 * 1)
 
-            # ---- steady: j = 1 .. n_tiles-2, two iterations per trip ----
-            trips = (n_tiles - 2) // 2
-            if trips > 0:
-                trip = reg.scalar(u32, init=0)
-                go = reg.scalar(pred)
-                ptx.inst.setp.lt.u32(go, trip, trips)
-                with ptx.loop("mma_loop", pred=go):
-                    # j odd: V in slot 3, next K in slot 0
-                    wait_kv(3)
-                    for stage in range(Q_STAGE):
-                        pv_mma(stage, 1, first_accum=False, par=1)
-                        if stage == 0:
-                            wait_kv(0)
-                        qk_mma(stage, 0)
-                    ptx.tcgen05.commit(base + BAR_KV_FREE + 8 * 0)
-                    ptx.tcgen05.commit(base + BAR_KV_FREE + 8 * 3)
-                    # j even: V in slot 1, next K in slot 2
-                    wait_kv(1)
-                    for stage in range(Q_STAGE):
-                        pv_mma(stage, 0, first_accum=False, par=0)
-                        if stage == 0:
-                            wait_kv(2)
-                        qk_mma(stage, 1)
-                    ptx.tcgen05.commit(base + BAR_KV_FREE + 8 * 2)
-                    ptx.tcgen05.commit(base + BAR_KV_FREE + 8 * 1)
-                    trip += 1
+                # ---- steady: j = 1 .. n_tiles-2, two iterations per trip ----
+                trips = (n_tiles - 2) // 2
+                if trips > 0:
+                    trip = reg.scalar(u32, init=0)
+                    go = reg.scalar(pred)
                     ptx.inst.setp.lt.u32(go, trip, trips)
+                    with ptx.loop("mma_loop", pred=go):
+                        # j odd: V in slot 3, next K in slot 0
+                        wait_kv(3)
+                        for stage in range(Q_STAGE):
+                            pv_mma(stage, 1, first_accum=False, par=1)
+                            if stage == 0:
+                                wait_kv(0)
+                            qk_mma(stage, 0)
+                        ptx.tcgen05.commit(base + BAR_KV_FREE + 8 * 0)
+                        ptx.tcgen05.commit(base + BAR_KV_FREE + 8 * 3)
+                        # j even: V in slot 1, next K in slot 2
+                        wait_kv(1)
+                        for stage in range(Q_STAGE):
+                            pv_mma(stage, 0, first_accum=False, par=0)
+                            if stage == 0:
+                                wait_kv(2)
+                            qk_mma(stage, 1)
+                        ptx.tcgen05.commit(base + BAR_KV_FREE + 8 * 2)
+                        ptx.tcgen05.commit(base + BAR_KV_FREE + 8 * 1)
+                        trip += 1
+                        ptx.inst.setp.lt.u32(go, trip, trips)
 
-            # ---- peeled j = n_tiles-1 (odd): PV only, V in slot 3 ----
-            wait_kv(3)
-            for stage in range(Q_STAGE):
-                pv_mma(stage, 1, first_accum=False, par=1)
-            ptx.tcgen05.commit(base + BAR_O_DONE)
+                # all QKs for this work item are issued: release the Q
+                # buffer so the next item's Q TMA overlaps the final PV
+                # and the epilogue
+                ptx.tcgen05.commit(base + BAR_Q_FREE)
+
+                # ---- peeled j = n_tiles-1 (odd): PV only, V in slot 3 ----
+                wait_kv(3)
+                for stage in range(Q_STAGE):
+                    pv_mma(stage, 1, first_accum=False, par=1)
+                ptx.tcgen05.commit(base + BAR_KV_FREE + 8 * 3)
+                ptx.tcgen05.commit(base + BAR_O_DONE)
+
+                iter_sync(miter_ph, "mma")
+                ptx.inst.add.u32(mw, mw, num_ctas)
+                ptx.inst.setp.lt.u32(mgo, mw, total_work)
+
             # tail padding: correction's PV_DONE parity waits may lag the
-            # completion stream by 2 while idling through skip tiles; two
-            # extra completions per stage guarantee every pending parity
-            # test still sees a phase flip after the last real PV
-            for _ in range(2):
+            # completion stream while idling through skip tiles; extra
+            # completions per stage guarantee every pending parity test
+            # still sees a phase flip after the last real PV
+            for _ in range(8):
                 for stage in range(Q_STAGE):
                     ptx.tcgen05.commit(base + BAR_PV_DONE + 8 * stage)
 
@@ -879,41 +968,63 @@ def build_flash_attention_blackwell(
                 ptx.inst.mov.f32(sums_pend[stage], sums)
 
             assert n_tiles >= 2, "stale-basis softmax needs n_tiles >= 2"
-            for stage in range(Q_STAGE):
-                body(stage, is_first=True)
-            it = reg.scalar(u32, init=1)
-            go = reg.scalar(pred)
-            ptx.inst.setp.lt.u32(go, it, n_tiles)
-            with ptx.loop("softmax_loop", pred=go):
-                # parity-derived offsets: current tile's exchange slot,
-                # previous tile's slot, and PV(it)'s O_RESC parity barrier
-                tb = reg.scalar(u32)
-                ptx.inst.and_.b32(tb, it, 1)
-                pxc = reg.scalar(u32)
-                ptx.inst.shl.b32(pxc, tb, 10)
-                pxp = reg.scalar(u32)
-                ptx.inst.xor.b32(pxp, pxc, 1024)
-                po = reg.scalar(u32)
-                ptx.inst.shl.b32(po, tb, 3)
-                for stage in range(Q_STAGE):
-                    body(stage, is_first=False, pxc=pxc, pxp=pxp, po=po)
-                it += 1
-                ptx.inst.setp.lt.u32(go, it, n_tiles)
-
-            # drain: fold the last tile's sums into l (its basis decision
-            # never runs — the pending rescale cancels between O and l in
-            # the epilogue normalize), then publish row sums: both halves
-            # write, pair-sync, then A arrives the stats barrier so
-            # correction sees both halves' sums.
-            for s in range(Q_STAGE):
-                ptx.inst.add.f32(l_run[s], l_run[s], sums_pend[s])
-                ptx.inst.st.shared.b32(ptx.addr(sum_addr[s]), l_run[s])
-            ptx.bar.sync(pair_bar, 64)
-            with ptx.if_(is_a):
+            zero_f = reg.scalar(f32, init=0.0)
+            siter_ph = reg.scalar(b32, init=0)
+            sw = reg.scalar(u32); ptx.inst.mov.u32(sw, cta_id)
+            sgo = reg.scalar(pred)
+            ptx.inst.setp.lt.u32(sgo, sw, total_work)
+            with ptx.loop("softmax_work_loop", pred=sgo):
                 for s in range(Q_STAGE):
-                    sb = reg.scalar(u32)
-                    ptx.inst.add.u32(sb, stats_bar0, s * 4)
-                    ptx.inst.bar.arrive(sb, 64)
+                    ptx.inst.mov.f32(mneg[s], zero_f)
+                    ptx.inst.mov.f32(l_run[s], zero_f)
+                for stage in range(Q_STAGE):
+                    body(stage, is_first=True)
+                it = reg.scalar(u32, init=1)
+                go = reg.scalar(pred)
+                ptx.inst.setp.lt.u32(go, it, n_tiles)
+                with ptx.loop("softmax_loop", pred=go):
+                    # parity-derived offsets: current tile's exchange slot,
+                    # previous tile's slot, and PV(it)'s O_RESC parity bar
+                    tb = reg.scalar(u32)
+                    ptx.inst.and_.b32(tb, it, 1)
+                    pxc = reg.scalar(u32)
+                    ptx.inst.shl.b32(pxc, tb, 10)
+                    pxp = reg.scalar(u32)
+                    ptx.inst.xor.b32(pxp, pxc, 1024)
+                    po = reg.scalar(u32)
+                    ptx.inst.shl.b32(po, tb, 3)
+                    for stage in range(Q_STAGE):
+                        body(stage, is_first=False, pxc=pxc, pxp=pxp, po=po)
+                    it += 1
+                    ptx.inst.setp.lt.u32(go, it, n_tiles)
+
+                # drain: fold the last tile's sums into l (its basis
+                # decision never runs — the pending rescale cancels between
+                # O and l in the epilogue normalize), then publish row
+                # sums: both halves write, pair-sync, then A arrives the
+                # stats barrier so correction sees both halves' sums. The
+                # arrive is STATS_FREE-gated like every body publish —
+                # ungated, it could stack with the next work item's body-1
+                # arrive (which consumes the standing credit) to 64
+                # arrivals and complete a stats generation without
+                # correction ever syncing it.
+                for s in range(Q_STAGE):
+                    ptx.inst.add.f32(l_run[s], l_run[s], sums_pend[s])
+                    ptx.inst.st.shared.b32(ptx.addr(sum_addr[s]), l_run[s])
+                ptx.bar.sync(pair_bar, 64)
+                with ptx.if_(is_a):
+                    for s in range(Q_STAGE):
+                        ptx.mbarrier.wait(
+                            base + BAR_STATS_FREE + 8 * s, ph_stats[s]
+                        )
+                        ptx.inst.xor.b32(ph_stats[s], ph_stats[s], 1)
+                        sb = reg.scalar(u32)
+                        ptx.inst.add.u32(sb, stats_bar0, s * 4)
+                        ptx.inst.bar.arrive(sb, 64)
+
+                iter_sync(siter_ph, "softmax")
+                ptx.inst.add.u32(sw, sw, num_ctas)
+                ptx.inst.setp.lt.u32(sgo, sw, total_work)
 
         # =================================================================
         # Correction warps (tids 256-383): O rescale + epilogue
@@ -940,19 +1051,27 @@ def build_flash_attention_blackwell(
                 ptx.mbarrier.arrive(base + BAR_STATS_FREE + 8 * s)
 
             ovals = reg.array(f32, 64)
-
-            # alpha published at tile i (i = 0..n_tiles-2; the last tile
-            # publishes nothing) rescales O between PV(i) and PV(i+1). The
-            # wait for PV(i)'s completion happens EVERY iteration
-            # (correction idles here anyway) so the phase var tracks the
-            # true completion count — a parity-only wait inside the rare
-            # branch could alias an older same-parity completion and race
-            # the in-flight PV.
             ph_pv = [reg.scalar(b32, init=0) for _ in range(Q_STAGE)]
-            it = reg.scalar(u32, init=0)
-            go = reg.scalar(pred)
-            ptx.inst.setp.lt.u32(go, it, n_tiles - 1)
-            with ptx.loop("corr_loop", pred=go):
+            done_phase = reg.scalar(b32, init=0)
+            (po,) = ptx.global_ptrs(O)
+            opacked = reg.array(b32, 16)
+
+            citer_ph = reg.scalar(b32, init=0)
+            cw = reg.scalar(u32); ptx.inst.mov.u32(cw, cta_id)
+            cgo = reg.scalar(pred)
+            ptx.inst.setp.lt.u32(cgo, cw, total_work)
+            with ptx.loop("corr_work_loop", pred=cgo):
+              # alpha published at tile i (i = 0..n_tiles-2; the last tile
+              # publishes nothing) rescales O between PV(i) and PV(i+1).
+              # The wait for PV(i)'s completion happens EVERY iteration
+              # (correction idles here anyway) so the phase var tracks the
+              # true completion count — a parity-only wait inside the rare
+              # branch could alias an older same-parity completion and
+              # race the in-flight PV.
+              it = reg.scalar(u32, init=0)
+              go = reg.scalar(pred)
+              ptx.inst.setp.lt.u32(go, it, n_tiles - 1)
+              with ptx.loop("corr_loop", pred=go):
                 ponc = reg.scalar(u32)
                 ptx.inst.add.u32(ponc, it, 1)
                 ptx.inst.and_.b32(ponc, ponc, 1)
@@ -992,20 +1111,29 @@ def build_flash_attention_blackwell(
                 it += 1
                 ptx.inst.setp.lt.u32(go, it, n_tiles - 1)
 
-            # ---- epilogue: wait all PV done, normalize, store bf16 ----
-            done_phase = reg.scalar(b32, init=0)
-            ptx.mbarrier.wait(base + BAR_O_DONE, done_phase)
-            ptx.tcgen05.fence_after_thread_sync()
+              # drain: consume the last tile's PV_DONE completion so the
+              # per-work-item wait/completion counts stay exactly balanced
+              # (unconsumed completions would drift the parity waits)
+              for stage in range(Q_STAGE):
+                  ptx.mbarrier.wait(base + BAR_PV_DONE + 8 * stage, ph_pv[stage])
+                  ptx.inst.xor.b32(ph_pv[stage], ph_pv[stage], 1)
 
-            (po,) = ptx.global_ptrs(O)
-            out_row = reg.scalar(u32)
-            ptx.inst.add.u32(out_row, q_row0, row128)
+              # ---- epilogue: wait all PV done, normalize, store bf16 ----
+              ptx.mbarrier.wait(base + BAR_O_DONE, done_phase)
+              ptx.inst.xor.b32(done_phase, done_phase, 1)
+              ptx.tcgen05.fence_after_thread_sync()
 
-            opacked = reg.array(b32, 16)
-            for stage in range(Q_STAGE):
+              q_row0, _ = derive_rows(cw, want_kv=False)
+              out_row = reg.scalar(u32)
+              ptx.inst.add.u32(out_row, q_row0, row128)
+
+              for stage in range(Q_STAGE):
                 ptx.bar.sync(stats_bar[stage], 64)
                 la = smem.load(b32, ptx.addr(alpha_addr[stage] + 1024))
                 lb = smem.load(b32, ptx.addr(alpha_addr[stage] + 2048))
+                # return the final publish's credit; it becomes the next
+                # work item's standing STATS_FREE credit
+                ptx.mbarrier.arrive(base + BAR_STATS_FREE + 8 * stage)
                 l = reg.scalar(f32)
                 laf = reg.scalar(f32); lbf = reg.scalar(f32)
                 ptx.inst.mov.b32(laf, la)
@@ -1041,13 +1169,21 @@ def build_flash_attention_blackwell(
                             [opacked[vec * 4 + k] for k in range(4)],
                         )
 
+              # O has been read out: re-arm the next work item's PV(0)
+              # gate (O_RESC parity 0) — the fresh accumulation must not
+              # start before the epilogue read above
+              for s in range(Q_STAGE):
+                  ptx.mbarrier.arrive(base + BAR_O_RESC + 16 * s)
+
+              iter_sync(citer_ph, "corr")
+              ptx.inst.add.u32(cw, cw, num_ctas)
+              ptx.inst.setp.lt.u32(cgo, cw, total_work)
+
         ptx.bar.sync(0, 512)
         if waitmap:
             _wm_ctx.__exit__(None, None, None)
             is_cta0 = reg.scalar(pred)
-            zx = reg.scalar(u32)
-            ptx.inst.or_.b32(zx, m_block, bh)
-            ptx.inst.setp.eq.u32(is_cta0, zx, 0)
+            ptx.inst.setp.eq.u32(is_cta0, cta_id, 0)
             wm.flush(pred=is_cta0)
         with ptx.if_(alloc_warp):
             ptx.tcgen05.dealloc(tmem, 512)
