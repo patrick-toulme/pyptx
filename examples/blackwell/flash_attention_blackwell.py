@@ -1708,56 +1708,47 @@ def build_flash_attention_blackwell_2cta(
             ph_stats = reg.scalar(b32, init=0)
             tcount = reg.scalar(u32, init=0)
 
-            vals_lo = reg.array(f32, 64)
-            vals_hi = reg.array(f32, 64)
+            bufs = (reg.array(f32, 32), reg.array(f32, 32))
             packed = reg.array(b32, 16)
+            macc = [reg.scalar(f32) for _ in range(4)]
+            sacc = [reg.scalar(f32) for _ in range(4)]
 
-            def tile_max(dst, vals):
-                acc = [reg.scalar(f32) for _ in range(4)]
-                for a in range(4):
-                    ptx.inst.max.f32(acc[a], vals[a], vals[4 + a], vals[8 + a])
-                for i in range(12, 60, 8):
-                    for a in range(4):
-                        ptx.inst.max.f32(acc[a], acc[a], vals[i + a], vals[i + 4 + a])
-                for a in range(4):
-                    ptx.inst.max.f32(acc[a], acc[a], vals[60 + a])
-                ptx.inst.max.f32(acc[0], acc[0], acc[1], acc[2])
-                ptx.inst.max.f32(dst, acc[0], acc[3])
+            def exp_chunk(v):
+                for i in range(32):
+                    ptx.inst.fma.rn.f32(v[i], v[i], qk_scale_reg, mneg)
+                    ptx.inst.ex2.approx.ftz.f32(v[i], v[i])
 
-            def exp_pack_store(vals, m_scaled, p_base_addr, word_off):
-                for chunk in range(2):
-                    off = chunk * 32
-                    for i in range(off, off + 32):
-                        ptx.inst.fma.rn.f32(vals[i], vals[i], qk_scale_reg, m_scaled)
-                        ptx.inst.ex2.approx.ftz.f32(vals[i], vals[i])
-                    for c in range(16):
-                        ptx.inst.cvt.rn.bf16x2.f32(
-                            packed[c], vals[off + 2 * c + 1], vals[off + 2 * c]
-                        )
-                    pa = reg.scalar(b32)
-                    ptx.inst.add.u32(pa, p_base_addr, word_off + chunk * 16)
-                    ptx.tcgen05.st(pa, packed, shape="32x32b", count=16, dtype="b32")
-
-            def sum_half(vals, sum_dst):
-                acc = [reg.scalar(f32) for _ in range(4)]
+            def chunk_reduce(v, c):
+                # fold this chunk into the running per-thread max/sum accs
                 for a in range(4):
-                    ptx.inst.add.f32(acc[a], vals[a], vals[4 + a])
-                for i in range(8, 64, 4):
-                    for a in range(4):
-                        ptx.inst.add.f32(acc[a], acc[a], vals[i + a])
-                ptx.inst.add.f32(acc[0], acc[0], acc[1])
-                ptx.inst.add.f32(acc[2], acc[2], acc[3])
-                ptx.inst.add.f32(sum_dst, acc[0], acc[2])
+                    t = reg.scalar(f32)
+                    ptx.inst.max.f32(t, v[a], v[4 + a], v[8 + a])
+                    ptx.inst.max.f32(t, t, v[12 + a], v[16 + a])
+                    ptx.inst.max.f32(t, t, v[20 + a], v[24 + a])
+                    ptx.inst.max.f32(t, t, v[28 + a])
+                    if c == 0:
+                        ptx.inst.mov.f32(macc[a], t)
+                    else:
+                        ptx.inst.max.f32(macc[a], macc[a], t)
+                    s = reg.scalar(f32)
+                    ptx.inst.add.f32(s, v[a], v[4 + a])
+                    for i in range(8, 32, 4):
+                        ptx.inst.add.f32(s, s, v[i + a])
+                    if c == 0:
+                        ptx.inst.mov.f32(sacc[a], s)
+                    else:
+                        ptx.inst.add.f32(sacc[a], sacc[a], s)
 
             def body(is_first: bool):
                 bwait(base + B2_S_FULL + 8 * stage, ph_s, 5, stage)
                 ptx.inst.xor.b32(ph_s, ph_s, 1)
                 ptx.tcgen05.fence_after_thread_sync()
 
-                # issue both S loads, then run the PREVIOUS tile's
-                # deferred basis decision in their latency shadow
-                ptx.tcgen05.ld(vals_lo, s_lo, shape="32x32b", count=64, dtype="b32")
-                ptx.tcgen05.ld(vals_hi, s_hi, shape="32x32b", count=64, dtype="b32")
+                # issue the first chunk's load, then run the PREVIOUS
+                # tile's deferred basis decision in its latency shadow
+                a0 = reg.scalar(b32)
+                ptx.inst.mov.b32(a0, s_lo)
+                ptx.tcgen05.ld(bufs[0], a0, shape="32x32b", count=32, dtype="b32")
 
                 alpha = reg.scalar(f32)
                 if not is_first:
@@ -1776,13 +1767,25 @@ def build_flash_attention_blackwell_2cta(
                     ptx.inst.st.shared.b32(ptx.addr(alpha_addr), alpha)
                     ptx.mbarrier.arrive(base + B2_STATS_FULL + 8 * stage)
 
-                ptx.tcgen05.wait_ld()
+                # ---- stream 4 chunks: ld(c+1) flies under exp/store(c);
+                # stale basis, no tile max in front of the exps ----
+                for c in range(4):
+                    ptx.tcgen05.wait_ld()
+                    if c < 3:
+                        an = reg.scalar(b32)
+                        ptx.inst.add.u32(an, s_lo, (c + 1) * 32)
+                        ptx.tcgen05.ld(bufs[(c + 1) & 1], an,
+                                       shape="32x32b", count=32, dtype="b32")
+                    v = bufs[c & 1]
+                    exp_chunk(v)
+                    for k in range(16):
+                        ptx.inst.cvt.rn.bf16x2.f32(packed[k], v[2 * k + 1], v[2 * k])
+                    pa = reg.scalar(b32)
+                    ptx.inst.add.u32(pa, p_lo, c * 16)
+                    ptx.tcgen05.st(pa, packed, shape="32x32b", count=16, dtype="b32")
+                    chunk_reduce(v, c)
                 progress(1 + stage, tcount)
 
-                # stale basis: exp everything against the pending basis
-                # immediately — no tile max in front of the exps
-                exp_pack_store(vals_lo, mneg, p_lo, 0)
-                exp_pack_store(vals_hi, mneg, p_lo, 32)
                 ptx.tcgen05.wait_st()
                 progress(3 + stage, tcount)
                 if debug_beacon:
@@ -1792,18 +1795,13 @@ def build_flash_attention_blackwell_2cta(
                 ptx.cluster.arrive_remote(p_full_addr, rank0)
                 progress(9, tcount)
 
-                # deferred reductions on the exp'd values (exp2 is
+                # horizontal reduce into the pending carries (exp2 is
                 # monotonic; pmax > 2^thresh means the basis drifted)
-                max_a = reg.scalar(f32)
-                tile_max(max_a, vals_lo)
-                max_b = reg.scalar(f32)
-                tile_max(max_b, vals_hi)
-                ptx.inst.max.f32(pmax_pend, max_b, max_a)
-                sum_a = reg.scalar(f32)
-                sum_b = reg.scalar(f32)
-                sum_half(vals_lo, sum_a)
-                sum_half(vals_hi, sum_b)
-                ptx.inst.add.f32(sums_pend, sum_a, sum_b)
+                ptx.inst.max.f32(macc[0], macc[0], macc[1], macc[2])
+                ptx.inst.max.f32(pmax_pend, macc[0], macc[3])
+                ptx.inst.add.f32(sacc[0], sacc[0], sacc[1])
+                ptx.inst.add.f32(sacc[2], sacc[2], sacc[3])
+                ptx.inst.add.f32(sums_pend, sacc[0], sacc[2])
                 progress(10, tcount)
 
             zero_f = reg.scalar(f32, init=0.0)
