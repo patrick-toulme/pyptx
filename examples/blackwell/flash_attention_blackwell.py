@@ -1544,6 +1544,13 @@ def build_flash_attention_blackwell_2cta(
                 stride_bytes=dbg_v_stride, leading_bytes=dbg_v_leading,
                 swizzle="128B",
             )
+            # mma_level=5 probe: MN-major B over the FULL-tile geometry
+            # (the 1-CTA V configuration that runs at full speed there);
+            # numerics are garbage, only the fetch pattern matters
+            dv_full = ptx.tcgen05.descriptor(
+                base + SMEM2_KV,
+                stride_bytes=1024, leading_bytes=16384, swizzle="128B",
+            )
 
             def qk_mma(stage: int, k_idx: int):
                 d = tmem + TM_S[stage]
@@ -1605,7 +1612,15 @@ def build_flash_attention_blackwell_2cta(
                     db = dv0 if off_b == 0 else reg.scalar(b64)
                     if off_b:
                         ptx.inst.add.s64(db, dv0, off_b)
-                    if debug_mma_level == 2:
+                    if debug_mma_level == 5:
+                        # SMEM-A + MN-major B with FULL-tile geometry
+                        dbf = reg.scalar(b64)
+                        ptx.inst.add.s64(dbf, dv_full, kk * 128)
+                        ptx.tcgen05.mma(
+                            d, dq0, dbf, idesc_pv, kind="f16", cta_group=2,
+                            pred_operand=(p_noacc if (first_accum and kk == 0) else p_acc),
+                        )
+                    elif debug_mma_level == 2:
                         # PV with all-K-major operands (dq0/dk0, QK idesc)
                         ptx.tcgen05.mma(
                             d, dq0, dk0, idesc_qk, kind="f16", cta_group=2,
