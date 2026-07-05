@@ -735,7 +735,9 @@ class Kernel:
                             name=dname,
                             values=tuple(dvals),
                         ))
-                elif self._reqntid is not None:
+                if self._reqntid is not None and not any(
+                    d.name == "reqntid" for d in func_directives
+                ):
                     func_directives.append(FunctionDirective(
                         name="reqntid",
                         values=tuple(self._reqntid),
@@ -871,6 +873,88 @@ class Kernel:
                     f"{result.stderr}"
                 )
             return result.stdout
+
+    # Per-SM limits used by resources(); sm_90/sm_100 datacenter parts.
+    _SM_LIMITS = {
+        "regs": 65536,
+        "threads": 2048,
+        "smem_opt_in": 232448,   # 227 KB usable per CTA opt-in (sm_90a/sm_100a)
+    }
+
+    def resources(self, **kwargs: Any) -> dict:
+        """Compile with ptxas -v and report launch resources + occupancy math.
+
+        Returns a dict with registers, spills, per-CTA shared memory,
+        setmaxnreg region values found in the PTX, and the CTAs-per-SM
+        bound implied by each resource (the binding constraint is the
+        minimum). Answers "why won't a second CTA fit on the SM" without
+        guess-compile-fail loops.
+        """
+        import math as _math
+        import os
+        import re
+        import subprocess
+        import tempfile
+
+        from pyptx.jax_support import _find_ptxas
+
+        ptxas = _find_ptxas()
+        if ptxas is None:
+            raise RuntimeError("kernel.resources() requires ptxas (CUDA toolkit "
+                               "or pip nvidia-cuda-nvcc).")
+
+        ptx_source = self.ptx(**kwargs)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ptx_path = os.path.join(tmpdir, "k.ptx")
+            cubin_path = os.path.join(tmpdir, "k.cubin")
+            with open(ptx_path, "w") as f:
+                f.write(ptx_source)
+            result = subprocess.run(
+                [ptxas, f"-arch={self._arch}", "-v", "-o", cubin_path, ptx_path],
+                capture_output=True, text=True,
+            )
+        info = {
+            "ok": result.returncode == 0,
+            "ptxas_stderr": result.stderr.strip(),
+        }
+        if result.returncode != 0:
+            return info
+
+        m = re.search(r"Used (\d+) registers", result.stderr)
+        regs = int(m.group(1)) if m else None
+        m = re.search(r"(\d+) bytes spill stores, (\d+) bytes spill loads",
+                      result.stderr)
+        spills = (int(m.group(1)), int(m.group(2))) if m else (0, 0)
+        setmax = sorted({int(v) for v in re.findall(
+            r"setmaxnreg\.(?:inc|dec)\.sync\.aligned\.u32 (\d+)", ptx_source)})
+
+        threads = 1
+        for d in self._block:
+            threads *= int(d)
+        smem = int(self._smem)
+        lim = self._SM_LIMITS
+        regs8 = _math.ceil((regs or 0) / 8) * 8 if regs else None
+        by_regs = (lim["regs"] // (threads * regs8)) if regs8 else None
+        by_threads = lim["threads"] // threads if threads else None
+        by_smem = (lim["smem_opt_in"] // smem) if smem else None
+        bounds = {"regs": by_regs, "threads": by_threads, "smem": by_smem}
+        active = {k: v for k, v in bounds.items() if v is not None}
+        ctas = min(active.values()) if active else None
+        binding = [k for k, v in active.items() if v == ctas]
+
+        info.update({
+            "registers": regs,
+            "registers_rounded": regs8,
+            "spill_stores_bytes": spills[0],
+            "spill_loads_bytes": spills[1],
+            "threads_per_cta": threads,
+            "smem_per_cta": smem,
+            "setmaxnreg_values": setmax,
+            "ctas_per_sm_by": bounds,
+            "ctas_per_sm": ctas,
+            "binding_constraint": binding,
+        })
+        return info
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         """Call the kernel with concrete JAX arrays.
