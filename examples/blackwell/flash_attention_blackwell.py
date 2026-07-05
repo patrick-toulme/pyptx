@@ -83,9 +83,10 @@ BAR_STATS_FREE = SMEM_BARS + 200  # 2 x 8
 BAR_PV_DONE = SMEM_BARS + 216     # 2 x 8
 BAR_Q_FREE = SMEM_BARS + 232      # 8 (persistent: Q smem free for next work item)
 BAR_ITER = SMEM_BARS + 248        # 8 (dbg_lockstep only)
-BAR_EPI = SMEM_BARS + 256         # 8 (dbg_epi_gate bisection aid)
+BAR_EPI = SMEM_BARS + 256         # 8 (softmax item-start gate)
+BAR_O_DONE2 = SMEM_BARS + 264     # 8 (stage-1's final PV done)
 SMEM_TMEM_SLOT = SMEM_BARS + 240
-SMEM_BYTES = BAR_EPI + 8
+SMEM_BYTES = BAR_O_DONE2 + 8
 
 # TMEM columns
 TM_S = (0, 128)
@@ -289,6 +290,7 @@ def build_flash_attention_blackwell(
                 ptx.mbarrier.init(base + BAR_KV_FULL + 8 * s, 1)
                 ptx.mbarrier.init(base + BAR_KV_FREE + 8 * s, 1)
             ptx.mbarrier.init(base + BAR_O_DONE, 1)
+            ptx.mbarrier.init(base + BAR_O_DONE2, 1)
             ptx.mbarrier.init(base + BAR_Q_FREE, 1)
             if dbg_lockstep:
                 ptx.mbarrier.init(base + BAR_ITER, lock_count)
@@ -303,10 +305,12 @@ def build_flash_attention_blackwell(
 
         # Register-file repartition. setmaxnreg is warpgroup-collective, so
         # each aligned warpgroup executes its own dec/inc at the top of its
-        # role block. 144*256 + 80*128 + 144*128 = 65536. (Correction needs
-        # >= 80 for its 64-reg ovals array; softmax at 152 buys nothing.)
-        NREG_SOFTMAX = 144
-        NREG_CORR = 80
+        # role block. 136*256 + 96*128 + 144*128 = 65536. (Correction at 96
+        # fits 64-wide epilogue O loads — half the wait_ld round trips of
+        # the 32-wide quarters; the softmax item start is gated on exactly
+        # this readout.)
+        NREG_SOFTMAX = 136
+        NREG_CORR = 96
         NREG_OTHER = 144
 
         # =================================================================
@@ -1070,7 +1074,7 @@ def build_flash_attention_blackwell(
 
             ovals = reg.array(f32, 64)
             ph_pv = [reg.scalar(b32, init=0) for _ in range(Q_STAGE)]
-            done_phase = reg.scalar(b32, init=0)
+            done_phase = [reg.scalar(b32, init=0) for _ in range(Q_STAGE)]
             (po,) = ptx.global_ptrs(O)
             opacked = reg.array(b32, 16)
 
@@ -1143,8 +1147,8 @@ def build_flash_attention_blackwell(
               iter_sync(citer_ph, "corr")
 
               # ---- epilogue: wait all PV done, normalize, store bf16 ----
-              ptx.mbarrier.wait(base + BAR_O_DONE, done_phase)
-              ptx.inst.xor.b32(done_phase, done_phase, 1)
+              ptx.mbarrier.wait(base + BAR_O_DONE, done_phase[0])
+              ptx.inst.xor.b32(done_phase[0], done_phase[0], 1)
               ptx.tcgen05.fence_after_thread_sync()
 
               q_row0, _ = derive_rows(cw, want_kv=False)
@@ -1172,35 +1176,36 @@ def build_flash_attention_blackwell(
                     # debug build: store raw O (no normalization)
                     ptx.inst.mov.f32(inv_l, reg.scalar(f32, init=1.0))
 
-                for quarter in range(4):
+                for half in range(2):
                     addr = reg.scalar(b32)
-                    ptx.inst.add.u32(addr, o_addr[stage], quarter * 32)
-                    part = [ovals[i] for i in range(32)]
-                    ptx.tcgen05.ld(part, addr, shape="32x32b", count=32, dtype="b32")
+                    ptx.inst.add.u32(addr, o_addr[stage], half * 64)
+                    ptx.tcgen05.ld(ovals, addr, shape="32x32b", count=64, dtype="b32")
                     ptx.tcgen05.wait_ld()
-                    for i in range(32):
+                    for i in range(64):
                         ptx.inst.mul.f32(ovals[i], ovals[i], inv_l)
-                    for c in range(16):
-                        ptx.inst.cvt.rn.bf16x2.f32(
-                            opacked[c], ovals[2 * c + 1], ovals[2 * c]
-                        )
-                    for vec in range(4):
-                        ptx.inst.st.global_.v4.b32(
-                            ptx.addr(gptr, quarter * 64 + vec * 16),
-                            [opacked[vec * 4 + k] for k in range(4)],
-                        )
-                # return the final publish's credit only after this
-                # stage's O is fully read out; it becomes the next work
-                # item's standing STATS_FREE credit
+                    for q in range(2):
+                        for c in range(16):
+                            ptx.inst.cvt.rn.bf16x2.f32(
+                                opacked[c],
+                                ovals[32 * q + 2 * c + 1], ovals[32 * q + 2 * c]
+                            )
+                        for vec in range(4):
+                            ptx.inst.st.global_.v4.b32(
+                                ptx.addr(gptr, half * 128 + q * 64 + vec * 16),
+                                [opacked[vec * 4 + k] for k in range(4)],
+                            )
+                # this stage's O is fully read out: return the final
+                # publish's credit (next item's standing STATS_FREE
+                # credit) and release the softmax item-start gate after
+                # stage 0 (overlapping the stage-1 readout is safe; TC
+                # writes to O during any readout are NOT — the PV(0)
+                # re-arm stays after both stages)
                 ptx.mbarrier.arrive(base + BAR_STATS_FREE + 8 * stage)
+                if dbg_epi_gate and stage == 0:
+                    ptx.mbarrier.arrive(base + BAR_EPI)
 
-              # O has been read out: re-arm the next work item's PV(0)
-              # gate (O_RESC parity 0) — the fresh accumulation must not
-              # start before the epilogue read above
               for s in range(Q_STAGE):
                   ptx.mbarrier.arrive(base + BAR_O_RESC + 16 * s)
-              if dbg_epi_gate:
-                  ptx.mbarrier.arrive(base + BAR_EPI)
 
               ptx.inst.add.u32(cw, cw, num_ctas)
               ptx.inst.setp.lt.u32(cgo, cw, total_work)
