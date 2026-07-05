@@ -1198,6 +1198,7 @@ def build_flash_attention_blackwell_2cta(
     debug_paced_sim: bool = False,
     debug_mma_level: int = 4,
     debug_beacon: bool = False,
+    waitmap: bool = False,
 ):
     assert head_dim == HD, "2-CTA variant supports head_dim=128 only"
     assert seqlen % 512 == 0, f"seqlen must be a multiple of 512, got {seqlen}"
@@ -1215,13 +1216,15 @@ def build_flash_attention_blackwell_2cta(
     total_work = n_mblocks_c * batch_heads
     num_clusters = min(total_work, 74)
 
-    @kernel(
+    from pyptx.debugkit import WAITMAP_MAX_SITES, WaitMap
+    wm = WaitMap() if waitmap else None
+
+    kernel_kwargs = dict(
         in_specs=(
             Tile(total_rows, HD, bf16, Layout.TMA_128B, tma_box=(BM, 64)),
             Tile(total_rows, HD, bf16, Layout.TMA_128B, tma_box=(64, 64)),
             Tile(total_rows, HD, bf16, Layout.TMA_128B, tma_box=(BN, 64)),
         ),
-        out_specs=(Tile(total_rows, HD, bf16, Layout.ROW),),
         grid=(2 * num_clusters, 1, 1),
         cluster=(2, 1, 1),
         block=(512, 1, 1),
@@ -1234,9 +1237,21 @@ def build_flash_attention_blackwell_2cta(
             ("reqnctapercluster", (2, 1, 1)),
         ],
     )
-    def flash_attn_fwd_2cta(Q, K, V, O):
+    out_o = Tile(total_rows, HD, bf16, Layout.ROW)
+    if waitmap:
+        kernel_kwargs["out_specs"] = (
+            out_o, Tile(512, WAITMAP_MAX_SITES, b32, Layout.ROW))
+    else:
+        kernel_kwargs["out_specs"] = (out_o,)
+
+    def _fa2_body(Q, K, V, O, WM=None):
         base = smem.base()
         tid = reg.scalar(u32); ptx.inst.mov.u32(tid, ptx.special.tid.x())
+        if waitmap:
+            (pwm,) = ptx.global_ptrs(WM)
+            wm.attach(pwm, tid)
+            _wm_ctx = wm.active()
+            _wm_ctx.__enter__()
         cluster_x = reg.scalar(u32)
         ptx.inst.mov.u32(cluster_x, ptx.special.ctaid.x())
         ptx.inst.shr.u32(cluster_x, cluster_x, 1)
@@ -2083,11 +2098,29 @@ def build_flash_attention_blackwell_2cta(
 
         ptx.bar.sync(0, 512)
         ptx.cluster.sync()
+        if waitmap:
+            _wm_ctx.__exit__(None, None, None)
+            is_cta0 = reg.scalar(pred)
+            with ptx.scope():
+                cx = reg.scalar(u32)
+                ptx.inst.mov.u32(cx, ptx.special.ctaid.x())
+                ptx.inst.setp.eq.u32(is_cta0, cx, 0)
+            wm.flush(pred=is_cta0)
         with ptx.if_(alloc_warp):
             ptx.tcgen05.dealloc(tmem, 512, cta_group=2)
             ptx.tcgen05.relinquish_alloc_permit(cta_group=2)
         ptx.ret()
 
+    if waitmap:
+        @kernel(**kernel_kwargs)
+        def flash_attn_fwd_2cta(Q, K, V, O, WM):
+            _fa2_body(Q, K, V, O, WM)
+    else:
+        @kernel(**kernel_kwargs)
+        def flash_attn_fwd_2cta(Q, K, V, O):
+            _fa2_body(Q, K, V, O, None)
+
+    flash_attn_fwd_2cta._waitmap = wm
     return flash_attn_fwd_2cta
 
 

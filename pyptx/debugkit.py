@@ -280,9 +280,13 @@ class WaitMap:
     def _site_id(self) -> int:
         import inspect
 
-        for fr in inspect.stack()[2:8]:
+        for fr in inspect.stack()[2:9]:
             fn = fr.filename
             if "debugkit" in fn or "/ptx.py" in fn:
+                continue
+            if fr.function in ("bwait", "progress"):
+                # thin wait helpers: attribute the site to THEIR caller,
+                # or every wait in the kernel collapses to one site
                 continue
             name = f"{fn.rsplit('/', 1)[-1].removesuffix('.py')}:{fr.lineno}"
             break
