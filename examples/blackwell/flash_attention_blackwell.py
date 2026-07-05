@@ -1199,6 +1199,8 @@ def build_flash_attention_blackwell_2cta(
     debug_mma_level: int = 4,
     debug_beacon: bool = False,
     waitmap: bool = False,
+    dbg_v_stride: int = 1024,
+    dbg_v_leading: int = 16384,
 ):
     assert head_dim == HD, "2-CTA variant supports head_dim=128 only"
     assert seqlen % 512 == 0, f"seqlen must be a multiple of 512, got {seqlen}"
@@ -1539,7 +1541,8 @@ def build_flash_attention_blackwell_2cta(
             dk0 = ptx.tcgen05.masked_descriptor(base + SMEM2_KV)
             dv0 = ptx.tcgen05.descriptor(
                 base + SMEM2_KV + KV_HALF_BYTES,
-                stride_bytes=1024, leading_bytes=16384, swizzle="128B",
+                stride_bytes=dbg_v_stride, leading_bytes=dbg_v_leading,
+                swizzle="128B",
             )
 
             def qk_mma(stage: int, k_idx: int):
