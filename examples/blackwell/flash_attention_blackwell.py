@@ -861,16 +861,12 @@ def build_flash_attention_blackwell(
                     ptx.inst.mul.f32(l_run[stage], l_run[stage], alpha)
 
                     # publish alpha_{k-1}: it gates PV(k) (parity k&1) and
-                    # the O rescale runs between PV(k-1) and PV(k)
+                    # the O rescale runs between PV(k-1) and PV(k). The
+                    # common-case O_RESC release goes FIRST — putting it
+                    # behind the STATS_FREE wait chains PV(k) through
+                    # correction's PV_DONE round trip (~1000 cycles/tile
+                    # of TC idle at steady state).
                     with ptx.if_(is_a):
-                        ptx.mbarrier.wait(
-                            base + BAR_STATS_FREE + 8 * stage, ph_stats[stage]
-                        )
-                        ptx.inst.xor.b32(ph_stats[stage], ph_stats[stage], 1)
-                        ptx.inst.st.shared.b32(ptx.addr(alpha_addr[stage]), alpha)
-                        sb = reg.scalar(u32)
-                        ptx.inst.add.u32(sb, stats_bar0, stage * 4)
-                        ptx.inst.bar.arrive(sb, 64)
                         # common case: no row in this warp rescales ->
                         # release O_RESC directly (correction re-derives
                         # the same ballot and stays silent)
@@ -886,6 +882,16 @@ def build_flash_attention_blackwell(
                             ora = reg.scalar(u32)
                             ptx.inst.add.u32(ora, po, base + BAR_O_RESC + 16 * stage)
                         ptx.mbarrier.arrive(ora, pred=all_skip)
+                        # stats-slot publish for correction's bookkeeping
+                        # (and the rescale path when any row moved basis)
+                        ptx.mbarrier.wait(
+                            base + BAR_STATS_FREE + 8 * stage, ph_stats[stage]
+                        )
+                        ptx.inst.xor.b32(ph_stats[stage], ph_stats[stage], 1)
+                        ptx.inst.st.shared.b32(ptx.addr(alpha_addr[stage]), alpha)
+                        sb = reg.scalar(u32)
+                        ptx.inst.add.u32(sb, stats_bar0, stage * 4)
+                        ptx.inst.bar.arrive(sb, 64)
 
                 ptx.tcgen05.wait_ld()
 
