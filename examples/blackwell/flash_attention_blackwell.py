@@ -474,20 +474,20 @@ def build_flash_attention_blackwell(
 
             def pv_mma(stage: int, v_idx: int, first_accum: bool, par: int):
                 d = tmem + TM_O[stage]
-                for half in range(2):
+                for q in range(4):
                     ptx.mbarrier.wait(
-                        base + BAR_P_Q + 32 * stage + 16 * half,
-                        ph_pq[stage][half],
+                        base + BAR_P_Q + 32 * stage + 8 * q,
+                        ph_pq[stage][q],
                     )
-                    ph_pq[stage][half] ^= 1
-                    if half == 0:
+                    ph_pq[stage][q] ^= 1
+                    if q == 0:
                         ptx.mbarrier.wait(
                             base + BAR_O_RESC + 16 * stage + 8 * par,
                             ph_or[stage][par],
                         )
                         ph_or[stage][par] ^= 1
                     ptx.tcgen05.fence_after_thread_sync()
-                    for kk in range(4 * half, 4 * half + 4):
+                    for kk in (2 * q, 2 * q + 1):
                         a = tmem + (TM_P[stage] + kk * 8)
                         ptx.tcgen05.mma(
                             d, a, desc_v[v_idx][kk], idesc_pv,
@@ -584,37 +584,34 @@ def build_flash_attention_blackwell(
                     ptx.tcgen05.commit(base + BAR_PV_DONE + 8 * stage)
 
         # =================================================================
-        # Softmax pool (tids 0-255): all 8 warps cooperate on one S subtile.
-        # Warp w owns rows 32w..32w+31 cols 0-63; warp w+4 the same rows
-        # cols 64-127.
+        # Softmax: two stage-parallel warpgroups (warps 0-3 -> stage 0,
+        # warps 4-7 -> stage 1). Thread t owns row t&127 and streams its
+        # 128 columns in four 32-column chunks, ping-ponging two register
+        # buffers so each chunk's TMEM load flies under the previous
+        # chunk's exp. Stages no longer queue behind each other in a
+        # shared pool, and no cross-thread max exchange exists: every
+        # thread sees its whole row.
         # =================================================================
         with ptx.if_(is_softmax):
             ptx.setmaxnreg(NREG_SOFTMAX, inc=True)
+            if s_f16:
+                raise NotImplementedError(
+                    "s_f16 predates the streaming softmax (see git history)"
+                )
 
-            is_a = reg.scalar(pred)
-            ptx.inst.setp.lt.u32(is_a, tid, 128)
-            # column base: A -> 0, B -> 64 (S cols); P word base: A -> 0, B -> 32
-            col_base = reg.scalar(u32)
-            ptx.inst.and_.b32(col_base, tid, 128)
-            ptx.inst.shr.u32(col_base, col_base, 1)      # 0 or 64
-            p_word_base = reg.scalar(u32)
-            ptx.inst.shr.u32(p_word_base, col_base, 1)   # 0 or 32
+            stage_b = reg.scalar(u32)            # this warpgroup's Q stage
+            ptx.inst.and_.b32(stage_b, tid, 128)
+            ptx.inst.shr.u32(stage_b, stage_b, 7)
 
             qk_scale_reg = reg.scalar(f32, init=qk_scale)
-            # stale-basis softmax: P is exp'd against the pending per-row
-            # basis with no tile max in front. The basis only moves when a
-            # tile's exp'd max exceeds 2^rescale_threshold, so P stays
-            # bounded by 2^thresh and the O rescale (deferred one tile)
-            # fires rarely.
             thresh_p = reg.scalar(f32, init=float(2.0 ** rescale_threshold))
             one_f = reg.scalar(f32, init=1.0)
-            # mneg[s] = -(basis * qk_scale): exp arg is fma(x, qk, mneg)
-            mneg = [reg.scalar(f32, init=0.0) for _ in range(Q_STAGE)]
-            # tile k's max/sum are carried into tile k+1's body, where the
-            # basis decision and l-update run hidden under the S load
-            pmax_pend = [reg.scalar(f32, init=0.0) for _ in range(Q_STAGE)]
-            sums_pend = [reg.scalar(f32, init=0.0) for _ in range(Q_STAGE)]
-            l_run = [reg.scalar(f32, init=0.0) for _ in range(Q_STAGE)]
+            zero_f = reg.scalar(f32, init=0.0)
+            # per-thread state for this thread's row (stage implicit)
+            mneg = reg.scalar(f32, init=0.0)     # -(basis * qk_scale)
+            pmax_pend = reg.scalar(f32, init=0.0)
+            sums_pend = reg.scalar(f32, init=0.0)
+            l_run = reg.scalar(f32, init=0.0)
             if emu_pairs:
                 clamp_f = reg.scalar(f32, init=EX2_CLAMP)
                 big_f = reg.scalar(f32, init=EX2_BIG)
@@ -630,310 +627,198 @@ def build_flash_attention_blackwell(
                 qk2 = reg.scalar(b64)
                 ptx.inst.mov.b64(qk2, [qk_scale_reg, qk_scale_reg])
 
-            # S/P TMEM addresses per stage for this thread's half
-            s_addr = [reg.scalar(b32) for _ in range(Q_STAGE)]
-            p_addr = [reg.scalar(b32) for _ in range(Q_STAGE)]
-            for s in range(Q_STAGE):
-                ptx.inst.mov.b32(s_addr[s], tmem)
-                ptx.inst.add.u32(s_addr[s], s_addr[s], TM_S[s])
-                ptx.inst.add.u32(s_addr[s], s_addr[s], lane_addr_bits)
-                ptx.inst.add.u32(s_addr[s], s_addr[s], col_base)
-                ptx.inst.mov.b32(p_addr[s], tmem)
-                ptx.inst.add.u32(p_addr[s], p_addr[s], TM_P[s])
-                ptx.inst.add.u32(p_addr[s], p_addr[s], lane_addr_bits)
-                ptx.inst.add.u32(p_addr[s], p_addr[s], p_word_base)
+            # stage-relative addresses (runtime: stage differs per warp)
+            st_col = reg.scalar(u32)
+            ptx.inst.shl.b32(st_col, stage_b, 7)          # S/P column offset
+            sp_base = reg.scalar(b32)                     # S (and P) row base
+            ptx.inst.mov.b32(sp_base, tmem)
+            ptx.inst.add.u32(sp_base, sp_base, lane_addr_bits)
+            ptx.inst.add.u32(sp_base, sp_base, st_col)
 
-            # shared-memory addresses
-            alpha_addr = [reg.scalar(u32) for _ in range(Q_STAGE)]
-            sum_addr = [reg.scalar(u32) for _ in range(Q_STAGE)]
-            xchg_mine = [reg.scalar(u32) for _ in range(Q_STAGE)]
-            xchg_other = [reg.scalar(u32) for _ in range(Q_STAGE)]
+            st8 = reg.scalar(u32)
+            ptx.inst.shl.b32(st8, stage_b, 3)             # 8*stage
+            sfull_ad = reg.scalar(u32)
+            ptx.inst.add.u32(sfull_ad, st8, base + BAR_S_FULL)
+            sfree_ad = reg.scalar(u32)
+            ptx.inst.add.u32(sfree_ad, st8, base + BAR_STATS_FREE)
+            pq_ad = reg.scalar(u32)
+            with ptx.scope():
+                st32 = reg.scalar(u32)
+                ptx.inst.shl.b32(st32, stage_b, 5)
+                ptx.inst.add.u32(pq_ad, st32, base + BAR_P_Q)
+            oresc_ad = reg.scalar(u32)
+            with ptx.scope():
+                st16 = reg.scalar(u32)
+                ptx.inst.shl.b32(st16, stage_b, 4)
+                ptx.inst.add.u32(oresc_ad, st16, base + BAR_O_RESC)
+            stats_bar = reg.scalar(u32)          # named bar 1+w (s0) / 5+w (s1)
+            with ptx.scope():
+                st4 = reg.scalar(u32)
+                ptx.inst.shl.b32(st4, stage_b, 2)
+                ptx.inst.add.u32(stats_bar, warp_in_group, 1)
+                ptx.inst.add.u32(stats_bar, stats_bar, st4)
+            alpha_ad = reg.scalar(u32)
+            sum_ad = reg.scalar(u32)
             with ptx.scope():
                 row_b = reg.scalar(u32)
                 ptx.inst.shl.b32(row_b, row128, 2)
-                half_sel = reg.scalar(u32)      # 0 for A, 512 for B
-                ptx.inst.and_.b32(half_sel, tid, 128)
-                ptx.inst.shl.b32(half_sel, half_sel, 2)
-                other_sel = reg.scalar(u32)
-                ptx.inst.xor.b32(other_sel, half_sel, 512)
-                for s in range(Q_STAGE):
-                    ptx.inst.add.u32(alpha_addr[s], row_b, base + SMEM_STATS + s * 512)
-                    # sumA at +1024+s*512, sumB at +2048+s*512
-                    ptx.inst.add.u32(sum_addr[s], row_b, base + SMEM_STATS + 1024 + s * 512)
-                    ptx.inst.add.u32(sum_addr[s], sum_addr[s], half_sel)
-                    ptx.inst.add.u32(sum_addr[s], sum_addr[s], half_sel)
-                    # parity offset (0/1024) is added at use sites
-                    ptx.inst.add.u32(xchg_mine[s], row_b, base + SMEM_STATS + 3072 + s * 2048)
-                    ptx.inst.add.u32(xchg_other[s], xchg_mine[s], other_sel)
-                    ptx.inst.add.u32(xchg_mine[s], xchg_mine[s], half_sel)
+                st512 = reg.scalar(u32)
+                ptx.inst.shl.b32(st512, stage_b, 9)
+                ptx.inst.add.u32(alpha_ad, row_b, base + SMEM_STATS)
+                ptx.inst.add.u32(alpha_ad, alpha_ad, st512)
+                ptx.inst.add.u32(sum_ad, alpha_ad, 1024)
 
-            pair_bar = reg.scalar(u32)   # named barrier 9+w: warps (w, w+4)
-            ptx.inst.add.u32(pair_bar, warp_in_group, 9)
-            stats_bar0 = reg.scalar(u32)  # named barrier per (stage, warp)
-            ptx.inst.add.u32(stats_bar0, warp_in_group, 1)
+            ph_s = reg.scalar(b32, init=0)
+            ph_stats = reg.scalar(b32, init=0)
 
-            ph_s = [reg.scalar(b32, init=0) for _ in range(Q_STAGE)]
-            ph_stats = [reg.scalar(b32, init=0) for _ in range(Q_STAGE)]
+            bufs = (reg.array(f32, 32), reg.array(f32, 32))
+            pk = reg.array(b32, 16)
+            macc = [reg.scalar(f32) for _ in range(4)]
+            sacc = [reg.scalar(f32) for _ in range(4)]
 
-            vals = reg.array(f32, 64)
-            packed = reg.array(b32, 16)
-            from pyptx.types import b16 as _b16
-            if s_f16:
-                # f16 datapath: 32 f16x2 regs hold the thread's 64 values
-                pwb = reg.array(b32, 32)
-                qh16 = reg.scalar(_b16)
-                ptx.inst.cvt.rn.f16.f32(qh16, qk_scale_reg)
-                q2h = reg.scalar(b32)
-                ptx.inst.mov.b32(q2h, [qh16, qh16])
+            def exp_pair_emu(v, i):
+                # exp2 via degree-3 poly on the packed f32x2 pipe
+                a0 = reg.scalar(f32); a1 = reg.scalar(f32)
+                ptx.inst.max.ftz.f32(a0, v[i], clamp_f)
+                ptx.inst.max.ftz.f32(a1, v[i + 1], clamp_f)
+                l1 = reg.scalar(b64)
+                ptx.inst.mov.b64(l1, [a0, a1])
+                ptx.inst.fma.rn.ftz.f32x2(l1, l1, qk2, m2)
+                l7 = reg.scalar(b64); l8 = reg.scalar(b64); l9 = reg.scalar(b64)
+                ptx.inst.add.rm.ftz.f32x2(l7, l1, big2)
+                ptx.inst.sub.rn.ftz.f32x2(l8, l7, big2)
+                ptx.inst.sub.rn.ftz.f32x2(l9, l1, l8)
+                l10 = reg.scalar(b64)
+                ptx.inst.fma.rn.ftz.f32x2(l10, l9, c3_2, c2_2)
+                ptx.inst.fma.rn.ftz.f32x2(l10, l10, l9, c1_2)
+                ptx.inst.fma.rn.ftz.f32x2(l10, l10, l9, c0_2)
+                r1 = reg.scalar(b32); r2 = reg.scalar(b32)
+                r3 = reg.scalar(b32); r4 = reg.scalar(b32)
+                ptx.inst.mov.b64([r1, r2], l7)
+                ptx.inst.mov.b64([r3, r4], l10)
+                ptx.inst.shl.b32(r1, r1, 23)
+                ptx.inst.add.s32(r1, r1, r3)
+                ptx.inst.shl.b32(r2, r2, 23)
+                ptx.inst.add.s32(r2, r2, r4)
+                ptx.inst.mov.b32(v[i], r1)
+                ptx.inst.mov.b32(v[i + 1], r2)
 
-            def tile_max(dst):
-                # 3-input max over the thread's 64 columns
-                acc = [reg.scalar(f32) for _ in range(4)]
+            def exp_chunk(v):
+                for pair in range(16):
+                    i = 2 * pair
+                    if pair in emu_pairs:
+                        exp_pair_emu(v, i)
+                        continue
+                    ptx.inst.fma.rn.f32(v[i], v[i], qk_scale_reg, mneg)
+                    ptx.inst.ex2.approx.ftz.f32(v[i], v[i])
+                    ptx.inst.fma.rn.f32(v[i + 1], v[i + 1], qk_scale_reg, mneg)
+                    ptx.inst.ex2.approx.ftz.f32(v[i + 1], v[i + 1])
+
+            def chunk_reduce(v, c):
+                # fold this chunk into the running per-thread max/sum accs
                 for a in range(4):
-                    ptx.inst.max.f32(acc[a], vals[a], vals[4 + a], vals[8 + a])
-                for i in range(12, 60, 8):
-                    for a in range(4):
-                        ptx.inst.max.f32(acc[a], acc[a], vals[i + a], vals[i + 4 + a])
-                for a in range(4):
-                    ptx.inst.max.f32(acc[a], acc[a], vals[60 + a])
-                ptx.inst.max.f32(acc[0], acc[0], acc[1], acc[2])
-                ptx.inst.max.f32(dst, acc[0], acc[3])
+                    t = reg.scalar(f32)
+                    ptx.inst.max.f32(t, v[a], v[4 + a], v[8 + a])
+                    ptx.inst.max.f32(t, t, v[12 + a], v[16 + a])
+                    ptx.inst.max.f32(t, t, v[20 + a], v[24 + a])
+                    ptx.inst.max.f32(t, t, v[28 + a])
+                    if c == 0:
+                        ptx.inst.mov.f32(macc[a], t)
+                    else:
+                        ptx.inst.max.f32(macc[a], macc[a], t)
+                    s = reg.scalar(f32)
+                    ptx.inst.add.f32(s, v[a], v[4 + a])
+                    for i in range(8, 32, 4):
+                        ptx.inst.add.f32(s, s, v[i + a])
+                    if c == 0:
+                        ptx.inst.mov.f32(sacc[a], s)
+                    else:
+                        ptx.inst.add.f32(sacc[a], sacc[a], s)
 
-            def body(stage: int, is_first: bool, pxc=None, pxp=None, po=None):
-                ptx.mbarrier.wait(base + BAR_S_FULL + 8 * stage, ph_s[stage])
-                ptx.inst.xor.b32(ph_s[stage], ph_s[stage], 1)
+            def body(is_first: bool, po=None):
+                ptx.mbarrier.wait(sfull_ad, ph_s)
+                ptx.inst.xor.b32(ph_s, ph_s, 1)
                 ptx.tcgen05.fence_after_thread_sync()
 
-                # issue the S load, then run the PREVIOUS tile's deferred
-                # basis maintenance in its latency shadow
-                if s_f16:
-                    # f16-D S is unpacked (one f16 per word); pack::16b
-                    # reads 2 adjacent columns per register
-                    pw = [pwb[i] for i in range(32)]
-                    ptx.tcgen05.ld(pw, s_addr[stage], shape="32x32b", count=32,
-                                   dtype="b32", pack=True)
-                else:
-                    ptx.tcgen05.ld(vals, s_addr[stage], shape="32x32b", count=64, dtype="b32")
+                # first chunk's load flies under the deferred tail
+                a0 = reg.scalar(b32)
+                ptx.inst.mov.b32(a0, sp_base)
+                ptx.tcgen05.ld(bufs[0], a0, shape="32x32b", count=32, dtype="b32")
 
                 if not is_first:
-                    # ---- deferred tail of tile k-1 ----
-                    ptx.bar.sync(pair_bar, 64)
-                    if pxp is None:
-                        oaddr = xchg_other[stage]
-                    else:
-                        oaddr = reg.scalar(u32)
-                        ptx.inst.add.u32(oaddr, xchg_other[stage], pxp)
-                    other = smem.load(b32, ptx.addr(oaddr))
-                    other_f = reg.scalar(f32)
-                    ptx.inst.mov.b32(other_f, other)
-                    pmax = reg.scalar(f32)
-                    ptx.inst.max.f32(pmax, pmax_pend[stage], other_f)
-
+                    # ---- deferred tail of tile k-1: basis decision from
+                    # this thread's own row max (no exchange) ----
                     alpha = reg.scalar(f32)
                     ptx.inst.mov.f32(alpha, one_f)
                     move = reg.scalar(pred)
-                    ptx.inst.setp.gt.f32(move, pmax, thresh_p)
+                    ptx.inst.setp.gt.f32(move, pmax_pend, thresh_p)
                     with ptx.if_(move):
-                        # snap basis to the previous tile's max: alpha =
-                        # 1/pmax matches the shift applied via mneg
-                        ptx.inst.rcp.approx.f32(alpha, pmax)
+                        ptx.inst.rcp.approx.f32(alpha, pmax_pend)
                         lgp = reg.scalar(f32)
-                        ptx.inst.lg2.approx.f32(lgp, pmax)
-                        ptx.inst.sub.f32(mneg[stage], mneg[stage], lgp)
+                        ptx.inst.lg2.approx.f32(lgp, pmax_pend)
+                        ptx.inst.sub.f32(mneg, mneg, lgp)
+                    ptx.inst.add.f32(l_run, l_run, sums_pend)
+                    ptx.inst.mul.f32(l_run, l_run, alpha)
 
-                    # l joins tile k-1's sums, then moves to the new basis
-                    ptx.inst.add.f32(l_run[stage], l_run[stage], sums_pend[stage])
-                    ptx.inst.mul.f32(l_run[stage], l_run[stage], alpha)
+                    # publish alpha_{k-1}: gates PV(k) at parity k&1. The
+                    # common-case O_RESC release goes first; the stats-slot
+                    # publish (paced by correction) follows.
+                    needs = reg.scalar(pred)
+                    ptx.inst.setp.lt.f32(needs, alpha, one_f)
+                    blt = reg.scalar(b32)
+                    ptx.inst.vote.sync.ballot.b32(blt, needs, 0xFFFFFFFF)
+                    all_skip = reg.scalar(pred)
+                    ptx.inst.setp.eq.b32(all_skip, blt, 0)
+                    ora = reg.scalar(u32)
+                    if po is None:
+                        ptx.inst.add.u32(ora, oresc_ad, 8)
+                    else:
+                        ptx.inst.add.u32(ora, oresc_ad, po)
+                    ptx.mbarrier.arrive(ora, pred=all_skip)
+                    ptx.mbarrier.wait(sfree_ad, ph_stats)
+                    ptx.inst.xor.b32(ph_stats, ph_stats, 1)
+                    ptx.inst.st.shared.b32(ptx.addr(alpha_ad), alpha)
+                    ptx.inst.bar.arrive(stats_bar, 64)
 
-                    # publish alpha_{k-1}: it gates PV(k) (parity k&1) and
-                    # the O rescale runs between PV(k-1) and PV(k). The
-                    # common-case O_RESC release goes FIRST — putting it
-                    # behind the STATS_FREE wait chains PV(k) through
-                    # correction's PV_DONE round trip (~1000 cycles/tile
-                    # of TC idle at steady state).
-                    with ptx.if_(is_a):
-                        # common case: no row in this warp rescales ->
-                        # release O_RESC directly (correction re-derives
-                        # the same ballot and stays silent)
-                        needs = reg.scalar(pred)
-                        ptx.inst.setp.lt.f32(needs, alpha, one_f)
-                        blt = reg.scalar(b32)
-                        ptx.inst.vote.sync.ballot.b32(blt, needs, 0xFFFFFFFF)
-                        all_skip = reg.scalar(pred)
-                        ptx.inst.setp.eq.b32(all_skip, blt, 0)
-                        if po is None:
-                            ora = base + BAR_O_RESC + 16 * stage + 8
-                        else:
-                            ora = reg.scalar(u32)
-                            ptx.inst.add.u32(ora, po, base + BAR_O_RESC + 16 * stage)
-                        ptx.mbarrier.arrive(ora, pred=all_skip)
-                        # stats-slot publish for correction's bookkeeping
-                        # (and the rescale path when any row moved basis)
-                        ptx.mbarrier.wait(
-                            base + BAR_STATS_FREE + 8 * stage, ph_stats[stage]
-                        )
-                        ptx.inst.xor.b32(ph_stats[stage], ph_stats[stage], 1)
-                        ptx.inst.st.shared.b32(ptx.addr(alpha_addr[stage]), alpha)
-                        sb = reg.scalar(u32)
-                        ptx.inst.add.u32(sb, stats_bar0, stage * 4)
-                        ptx.inst.bar.arrive(sb, 64)
-
-                ptx.tcgen05.wait_ld()
-
-                # stale basis: exp everything against the pending per-row
-                # basis immediately — no tile max in front of the exps
-                m_scaled = mneg[stage]
                 if emu_pairs:
-                    m2 = reg.scalar(b64)
-                    ptx.inst.mov.b64(m2, [m_scaled, m_scaled])
+                    ptx.inst.mov.b64(m2, [mneg, mneg])
 
-                def exp_pair_emu(i):
-                    # exp2 via degree-3 poly on the packed f32x2 pipe
-                    a0 = reg.scalar(f32); a1 = reg.scalar(f32)
-                    ptx.inst.max.ftz.f32(a0, vals[i], clamp_f)
-                    ptx.inst.max.ftz.f32(a1, vals[i + 1], clamp_f)
-                    l1 = reg.scalar(b64)
-                    ptx.inst.mov.b64(l1, [a0, a1])
-                    ptx.inst.fma.rn.ftz.f32x2(l1, l1, qk2, m2)
-                    l7 = reg.scalar(b64); l8 = reg.scalar(b64); l9 = reg.scalar(b64)
-                    ptx.inst.add.rm.ftz.f32x2(l7, l1, big2)
-                    ptx.inst.sub.rn.ftz.f32x2(l8, l7, big2)
-                    ptx.inst.sub.rn.ftz.f32x2(l9, l1, l8)
-                    l10 = reg.scalar(b64)
-                    ptx.inst.fma.rn.ftz.f32x2(l10, l9, c3_2, c2_2)
-                    ptx.inst.fma.rn.ftz.f32x2(l10, l10, l9, c1_2)
-                    ptx.inst.fma.rn.ftz.f32x2(l10, l10, l9, c0_2)
-                    r1 = reg.scalar(b32); r2 = reg.scalar(b32)
-                    r3 = reg.scalar(b32); r4 = reg.scalar(b32)
-                    ptx.inst.mov.b64([r1, r2], l7)
-                    ptx.inst.mov.b64([r3, r4], l10)
-                    ptx.inst.shl.b32(r1, r1, 23)
-                    ptx.inst.add.s32(r1, r1, r3)
-                    ptx.inst.shl.b32(r2, r2, 23)
-                    ptx.inst.add.s32(r2, r2, r4)
-                    ptx.inst.mov.b32(vals[i], r1)
-                    ptx.inst.mov.b32(vals[i + 1], r2)
-
-                def exp_chunk(off):
-                    for pair in range(16):
-                        i = off + 2 * pair
-                        if pair in emu_pairs:
-                            exp_pair_emu(i)
-                            continue
-                        ptx.inst.fma.rn.f32(vals[i], vals[i], qk_scale_reg, m_scaled)
-                        ptx.inst.ex2.approx.ftz.f32(vals[i], vals[i])
-                        ptx.inst.fma.rn.f32(vals[i + 1], vals[i + 1], qk_scale_reg, m_scaled)
-                        ptx.inst.ex2.approx.ftz.f32(vals[i + 1], vals[i + 1])
-
-                # exp all 64 values, pack, and publish P as early as
-                # possible — nothing about maxima gates this path
-                if s_f16:
-                    # 2-way SIMD exp; results are already packed f16 pairs,
-                    # so the store path is identical to the bf16x2 layout.
-                    # Store in two chunks so the first drains under the
-                    # second chunk's exp work.
-                    mh = reg.scalar(_b16)
-                    ptx.inst.cvt.rn.f16.f32(mh, m_scaled)
-                    m2h = reg.scalar(b32)
-                    ptx.inst.mov.b32(m2h, [mh, mh])
-                    for i in range(16):
-                        ptx.inst.fma.rn.f16x2(pwb[i], pwb[i], q2h, m2h)
-                        ptx.inst.ex2.approx.f16x2(pwb[i], pwb[i])
-                    ptx.tcgen05.st(p_addr[stage], [pwb[i] for i in range(16)],
-                                   shape="32x32b", count=16, dtype="b32")
-                    for i in range(16, 32):
-                        ptx.inst.fma.rn.f16x2(pwb[i], pwb[i], q2h, m2h)
-                        ptx.inst.ex2.approx.f16x2(pwb[i], pwb[i])
+                # ---- stream 4 chunks: ld(c+1) flies under exp/store(c) --
+                for c in range(4):
+                    ptx.tcgen05.wait_ld()
+                    if c < 3:
+                        an = reg.scalar(b32)
+                        ptx.inst.add.u32(an, sp_base, (c + 1) * 32)
+                        ptx.tcgen05.ld(bufs[(c + 1) & 1], an,
+                                       shape="32x32b", count=32, dtype="b32")
+                    v = bufs[c & 1]
+                    exp_chunk(v)
+                    for k in range(16):
+                        ptx.inst.cvt.rn.bf16x2.f32(pk[k], v[2 * k + 1], v[2 * k])
                     pa = reg.scalar(b32)
-                    ptx.inst.add.u32(pa, p_addr[stage], 16)
-                    ptx.tcgen05.st(pa, [pwb[i] for i in range(16, 32)],
-                                   shape="32x32b", count=16, dtype="b32")
-                else:
-                    exp_chunk(0)
-                    for c in range(16):
-                        ptx.inst.cvt.rn.bf16x2.f32(packed[c], vals[2 * c + 1], vals[2 * c])
-                    ptx.tcgen05.st(p_addr[stage], packed, shape="32x32b", count=16, dtype="b32")
-                    exp_chunk(32)
-                    for c in range(16):
-                        ptx.inst.cvt.rn.bf16x2.f32(
-                            packed[c], vals[32 + 2 * c + 1], vals[32 + 2 * c]
-                        )
-                    pa = reg.scalar(b32)
-                    ptx.inst.add.u32(pa, p_addr[stage], 16)
-                    ptx.tcgen05.st(pa, packed, shape="32x32b", count=16, dtype="b32")
-                # one arrive per half: A -> quarter barrier 0, B -> 2
-                ptx.tcgen05.wait_st()
-                ptx.tcgen05.fence_before_thread_sync()
-                qbar = reg.scalar(u32)
-                ptx.inst.shr.u32(qbar, col_base, 2)  # 0 (A) or 16 (B)
-                ptx.inst.add.u32(qbar, qbar, base + BAR_P_Q + 32 * stage)
-                ptx.mbarrier.arrive(qbar)
+                    ptx.inst.add.u32(pa, sp_base, c * 16)
+                    ptx.tcgen05.st(pa, pk, shape="32x32b", count=16, dtype="b32")
+                    # publish this quarter (32 columns) immediately; the
+                    # wait_st round trip hides under the next chunk's
+                    # in-flight load
+                    ptx.tcgen05.wait_st()
+                    ptx.tcgen05.fence_before_thread_sync()
+                    qb = reg.scalar(u32)
+                    ptx.inst.add.u32(qb, pq_ad, 8 * c)
+                    ptx.mbarrier.arrive(qb)
+                    chunk_reduce(v, c)
 
-                # ---- carry this tile's max and sums into the next body ----
-                # tile max on the exp'd values; exp2 is monotonic, so
-                # pmax = 2^((max_x)*qk + mneg) and pmax > 2^thresh means the
-                # basis has drifted more than rescale_threshold behind. The
-                # exchange completes in the NEXT body, hidden under its S
-                # load; the store targets this tile's parity slot.
-                if s_f16:
-                    macc = [reg.scalar(b32) for _ in range(4)]
-                    for a in range(4):
-                        ptx.inst.max.f16x2(macc[a], pwb[a], pwb[4 + a])
-                    for i in range(8, 32, 4):
-                        for a in range(4):
-                            ptx.inst.max.f16x2(macc[a], macc[a], pwb[i + a])
-                    ptx.inst.max.f16x2(macc[0], macc[0], macc[1])
-                    ptx.inst.max.f16x2(macc[2], macc[2], macc[3])
-                    ptx.inst.max.f16x2(macc[0], macc[0], macc[2])
-                    h0 = reg.scalar(_b16); h1 = reg.scalar(_b16)
-                    ptx.inst.mov.b32([h0, h1], macc[0])
-                    f0 = reg.scalar(f32); f1 = reg.scalar(f32)
-                    ptx.inst.cvt.f32.f16(f0, h0)
-                    ptx.inst.cvt.f32.f16(f1, h1)
-                    ptx.inst.max.f32(pmax_pend[stage], f0, f1)
-                else:
-                    tile_max(pmax_pend[stage])
-                if pxc is None:
-                    maddr = xchg_mine[stage]
-                else:
-                    maddr = reg.scalar(u32)
-                    ptx.inst.add.u32(maddr, xchg_mine[stage], pxc)
-                ptx.inst.st.shared.b32(ptx.addr(maddr), pmax_pend[stage])
+                # horizontal reduce into the pending carries
+                ptx.inst.max.f32(macc[0], macc[0], macc[1], macc[2])
+                ptx.inst.max.f32(pmax_pend, macc[0], macc[3])
+                ptx.inst.add.f32(sacc[0], sacc[0], sacc[1])
+                ptx.inst.add.f32(sacc[2], sacc[2], sacc[3])
+                ptx.inst.add.f32(sums_pend, sacc[0], sacc[2])
 
-                sums = reg.scalar(f32)
-                if s_f16:
-                    # one f16x2 pair-add level, then finish in f32
-                    sacc = [reg.scalar(b32) for _ in range(4)]
-                    for a in range(4):
-                        ptx.inst.add.rn.f16x2(sacc[a], pwb[a], pwb[4 + a])
-                    for i in range(8, 32, 4):
-                        for a in range(4):
-                            ptx.inst.add.rn.f16x2(sacc[a], sacc[a], pwb[i + a])
-                    ptx.inst.add.rn.f16x2(sacc[0], sacc[0], sacc[1])
-                    ptx.inst.add.rn.f16x2(sacc[2], sacc[2], sacc[3])
-                    sh = [reg.scalar(_b16) for _ in range(4)]
-                    ptx.inst.mov.b32([sh[0], sh[1]], sacc[0])
-                    ptx.inst.mov.b32([sh[2], sh[3]], sacc[2])
-                    sf = [reg.scalar(f32) for _ in range(4)]
-                    for k in range(4):
-                        ptx.inst.cvt.f32.f16(sf[k], sh[k])
-                    ptx.inst.add.f32(sf[0], sf[0], sf[1])
-                    ptx.inst.add.f32(sf[2], sf[2], sf[3])
-                    ptx.inst.add.f32(sums, sf[0], sf[2])
-                else:
-                    acc = [reg.scalar(f32) for _ in range(4)]
-                    for a in range(4):
-                        ptx.inst.add.f32(acc[a], vals[a], vals[4 + a])
-                    for i in range(8, 64, 4):
-                        for a in range(4):
-                            ptx.inst.add.f32(acc[a], acc[a], vals[i + a])
-                    ptx.inst.add.f32(acc[0], acc[0], acc[1])
-                    ptx.inst.add.f32(acc[2], acc[2], acc[3])
-                    ptx.inst.add.f32(sums, acc[0], acc[2])
-                ptx.inst.mov.f32(sums_pend[stage], sums)
+            if emu_pairs:
+                m2 = reg.scalar(b64)
 
             assert n_tiles >= 2, "stale-basis softmax needs n_tiles >= 2"
-            zero_f = reg.scalar(f32, init=0.0)
             siter_ph = reg.scalar(b32, init=0)
             sw = reg.scalar(u32); ptx.inst.mov.u32(sw, cta_id)
             sgo = reg.scalar(pred)
@@ -944,53 +829,29 @@ def build_flash_attention_blackwell(
                 if dbg_epi_gate == "softmax":
                     ptx.mbarrier.wait(base + BAR_EPI, epi_ph)
                     ptx.inst.xor.b32(epi_ph, epi_ph, 1)
-                for s in range(Q_STAGE):
-                    ptx.inst.mov.f32(mneg[s], zero_f)
-                    ptx.inst.mov.f32(l_run[s], zero_f)
-                for stage in range(Q_STAGE):
-                    body(stage, is_first=True)
+                ptx.inst.mov.f32(mneg, zero_f)
+                ptx.inst.mov.f32(l_run, zero_f)
+                body(is_first=True)
                 it = reg.scalar(u32, init=1)
                 go = reg.scalar(pred)
                 ptx.inst.setp.lt.u32(go, it, n_tiles)
                 with ptx.loop("softmax_loop", pred=go):
-                    # parity-derived offsets: current tile's exchange slot,
-                    # previous tile's slot, and PV(it)'s O_RESC parity bar
-                    tb = reg.scalar(u32)
-                    ptx.inst.and_.b32(tb, it, 1)
-                    pxc = reg.scalar(u32)
-                    ptx.inst.shl.b32(pxc, tb, 10)
-                    pxp = reg.scalar(u32)
-                    ptx.inst.xor.b32(pxp, pxc, 1024)
                     po = reg.scalar(u32)
-                    ptx.inst.shl.b32(po, tb, 3)
-                    for stage in range(Q_STAGE):
-                        body(stage, is_first=False, pxc=pxc, pxp=pxp, po=po)
+                    ptx.inst.and_.b32(po, it, 1)
+                    ptx.inst.shl.b32(po, po, 3)
+                    body(is_first=False, po=po)
                     it += 1
                     ptx.inst.setp.lt.u32(go, it, n_tiles)
 
                 # drain: fold the last tile's sums into l (its basis
                 # decision never runs — the pending rescale cancels between
-                # O and l in the epilogue normalize), then publish row
-                # sums: both halves write, pair-sync, then A arrives the
-                # stats barrier so correction sees both halves' sums. The
-                # arrive is STATS_FREE-gated like every body publish —
-                # ungated, it could stack with the next work item's body-1
-                # arrive (which consumes the standing credit) to 64
-                # arrivals and complete a stats generation without
-                # correction ever syncing it.
-                for s in range(Q_STAGE):
-                    ptx.inst.add.f32(l_run[s], l_run[s], sums_pend[s])
-                    ptx.inst.st.shared.b32(ptx.addr(sum_addr[s]), l_run[s])
-                ptx.bar.sync(pair_bar, 64)
-                with ptx.if_(is_a):
-                    for s in range(Q_STAGE):
-                        ptx.mbarrier.wait(
-                            base + BAR_STATS_FREE + 8 * s, ph_stats[s]
-                        )
-                        ptx.inst.xor.b32(ph_stats[s], ph_stats[s], 1)
-                        sb = reg.scalar(u32)
-                        ptx.inst.add.u32(sb, stats_bar0, s * 4)
-                        ptx.inst.bar.arrive(sb, 64)
+                # O and l in the epilogue normalize), publish the row sum,
+                # STATS_FREE-gated like every body publish.
+                ptx.inst.add.f32(l_run, l_run, sums_pend)
+                ptx.inst.st.shared.b32(ptx.addr(sum_ad), l_run)
+                ptx.mbarrier.wait(sfree_ad, ph_stats)
+                ptx.inst.xor.b32(ph_stats, ph_stats, 1)
+                ptx.inst.bar.arrive(stats_bar, 64)
 
                 iter_sync(siter_ph, "softmax")
                 ptx.inst.add.u32(sw, sw, num_ctas)
@@ -1108,13 +969,10 @@ def build_flash_attention_blackwell(
 
               for stage in range(Q_STAGE):
                 ptx.bar.sync(stats_bar[stage], 64)
+                # streaming softmax publishes one full-row sum per row
                 la = smem.load(b32, ptx.addr(alpha_addr[stage] + 1024))
-                lb = smem.load(b32, ptx.addr(alpha_addr[stage] + 2048))
                 l = reg.scalar(f32)
-                laf = reg.scalar(f32); lbf = reg.scalar(f32)
-                ptx.inst.mov.b32(laf, la)
-                ptx.inst.mov.b32(lbf, lb)
-                ptx.inst.add.f32(l, laf, lbf)
+                ptx.inst.mov.b32(l, la)
                 inv_l = reg.scalar(f32)
                 ptx.inst.rcp.approx.f32(inv_l, l)
 
