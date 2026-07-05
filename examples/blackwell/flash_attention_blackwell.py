@@ -64,16 +64,24 @@ SMEM_STATS = SMEM_KV + KV_SLOTS * TILE_BYTES  # 196608
 #   sumA[2][128]    @ +1024
 #   sumB[2][128]    @ +2048
 #   xchg[2][2][128] @ +3072  (stage, half, row)
-SMEM_BARS = SMEM_STATS + 5120                 # 201728
+# stats area: alpha[2][128] @0, sums[2][2][128] @1024, and the pair-max
+# exchange slots @3072 double-buffered by KV-tile parity
+# ([stage][parity][half][row] = stage*2048 + parity*1024 + half*512)
+SMEM_BARS = SMEM_STATS + 7168                 # 203776
 BAR_Q = SMEM_BARS + 0             # 2 x 8
 BAR_KV_FULL = SMEM_BARS + 16      # 4 x 8
 BAR_KV_FREE = SMEM_BARS + 48      # 4 x 8
 BAR_S_FULL = SMEM_BARS + 80       # 2 x 8
 BAR_P_Q = SMEM_BARS + 96          # 2 stages x 4 quarters x 8 = 64
-BAR_O_RESC = SMEM_BARS + 160      # 2 x 8
-BAR_O_DONE = SMEM_BARS + 176      # 8
-BAR_STATS_FREE = SMEM_BARS + 184  # 2 x 8
-SMEM_TMEM_SLOT = SMEM_BARS + 208
+# O_RESC is split by KV-tile parity: [stage][tile&1]. The alpha stream
+# can run up to two tiles ahead of the MMA warp's consumption, which
+# would alias a single barrier's phase parity; per-parity barriers keep
+# every waiter within one phase of its producer.
+BAR_O_RESC = SMEM_BARS + 160      # 2 stages x 2 parities x 8
+BAR_O_DONE = SMEM_BARS + 192      # 8
+BAR_STATS_FREE = SMEM_BARS + 200  # 2 x 8
+BAR_PV_DONE = SMEM_BARS + 216     # 2 x 8
+SMEM_TMEM_SLOT = SMEM_BARS + 232
 SMEM_BYTES = SMEM_TMEM_SLOT + 16
 
 # TMEM columns
@@ -135,9 +143,10 @@ def build_flash_attention_blackwell(
     sm_scale: float | None = None,
     arch: str = "sm_100a",
     rescale_threshold: float = RESCALE_THRESHOLD,
-    emu_pairs: tuple = (1, 3, 5, 7, 9, 11, 13, 15),
+    emu_pairs: tuple = (1, 3, 5, 7),
     s_f16: bool = False,   # experimental fp16 mode; see notes in docstring
     dbg_f16_noexp: bool = False,
+    waitmap: bool = False,
 ):
     assert head_dim == HD, "v1 supports head_dim=128 only"
     assert seqlen % (Q_STAGE * BM) == 0, f"seqlen must be a multiple of 256, got {seqlen}"
@@ -150,13 +159,15 @@ def build_flash_attention_blackwell(
     from pyptx.types import f16 as _f16t
     io_t = _f16t if s_f16 else bf16
 
-    @kernel(
+    from pyptx.debugkit import WAITMAP_MAX_SITES, WaitMap
+    wm = WaitMap() if waitmap else None
+
+    kernel_kwargs = dict(
         in_specs=(
             Tile(total_rows, HD, io_t, Layout.TMA_128B, tma_box=(BM, 64)),
             Tile(total_rows, HD, io_t, Layout.TMA_128B, tma_box=(BN, 64)),
             Tile(total_rows, HD, io_t, Layout.TMA_128B, tma_box=(BN, 64)),
         ),
-        out_specs=(Tile(total_rows, HD, io_t, Layout.ROW),),
         grid=(seqlen // (Q_STAGE * BM), batch_heads, 1),
         block=(512, 1, 1),
         arch=arch,
@@ -164,11 +175,23 @@ def build_flash_attention_blackwell(
         extern_smem=True,
         reqntid=(512, 1, 1),
     )
-    def flash_attn_fwd(Q, K, V, O):
+    out_o = Tile(total_rows, HD, io_t, Layout.ROW)
+    if waitmap:
+        kernel_kwargs["out_specs"] = (
+            out_o, Tile(512, WAITMAP_MAX_SITES, b32, Layout.ROW))
+    else:
+        kernel_kwargs["out_specs"] = (out_o,)
+
+    def _fa_body(Q, K, V, O, WM=None):
         base = smem.base()
         tid = reg.scalar(u32); ptx.inst.mov.u32(tid, ptx.special.tid.x())
         m_block = reg.scalar(u32); ptx.inst.mov.u32(m_block, ptx.special.ctaid.x())
         bh = reg.scalar(u32); ptx.inst.mov.u32(bh, ptx.special.ctaid.y())
+        if waitmap:
+            (pwm,) = ptx.global_ptrs(WM)
+            wm.attach(pwm, tid)
+            _wm_ctx = wm.active()
+            _wm_ctx.__enter__()
 
         warp = tid >> 5
         row128 = reg.scalar(u32); ptx.inst.and_.b32(row128, tid, 127)
@@ -206,8 +229,10 @@ def build_flash_attention_blackwell(
             for i in range(2):
                 ptx.mbarrier.init(base + BAR_Q + 8 * i, 1)
                 ptx.mbarrier.init(base + BAR_S_FULL + 8 * i, 1)
-                ptx.mbarrier.init(base + BAR_O_RESC + 8 * i, 128)
+                for par in range(2):
+                    ptx.mbarrier.init(base + BAR_O_RESC + 16 * i + 8 * par, 128)
                 ptx.mbarrier.init(base + BAR_STATS_FREE + 8 * i, 128)
+                ptx.mbarrier.init(base + BAR_PV_DONE + 8 * i, 1)
                 for qtr in range(4):
                     ptx.mbarrier.init(base + BAR_P_Q + 32 * i + 8 * qtr, 128)
             for s in range(KV_SLOTS):
@@ -222,10 +247,11 @@ def build_flash_attention_blackwell(
 
         # Register-file repartition. setmaxnreg is warpgroup-collective, so
         # each aligned warpgroup executes its own dec/inc at the top of its
-        # role block. 136*256 + 88*128 + 152*128 = 65536.
-        NREG_SOFTMAX = 136
-        NREG_CORR = 88
-        NREG_OTHER = 152
+        # role block. 144*256 + 80*128 + 144*128 = 65536. (Correction needs
+        # >= 80 for its 64-reg ovals array; softmax at 152 buys nothing.)
+        NREG_SOFTMAX = 144
+        NREG_CORR = 80
+        NREG_OTHER = 144
 
         # =================================================================
         # TMA load warp (single lane; warpgroup 12-15 takes NREG_OTHER)
@@ -358,13 +384,15 @@ def build_flash_attention_blackwell(
             ph_pq = [
                 [reg.scalar(b32, init=0) for _ in range(4)] for _ in range(Q_STAGE)
             ]
-            ph_or = [reg.scalar(b32, init=0) for _ in range(Q_STAGE)]
+            ph_or = [
+                [reg.scalar(b32, init=0) for _ in range(2)] for _ in range(Q_STAGE)
+            ]
 
             def wait_kv(slot: int):
                 ptx.mbarrier.wait(base + BAR_KV_FULL + 8 * slot, ph_kv[slot])
                 ph_kv[slot] ^= 1
 
-            def pv_mma(stage: int, v_idx: int, first_accum: bool):
+            def pv_mma(stage: int, v_idx: int, first_accum: bool, par: int):
                 d = tmem + TM_O[stage]
                 for half in range(2):
                     ptx.mbarrier.wait(
@@ -373,8 +401,11 @@ def build_flash_attention_blackwell(
                     )
                     ph_pq[stage][half] ^= 1
                     if half == 0:
-                        ptx.mbarrier.wait(base + BAR_O_RESC + 8 * stage, ph_or[stage])
-                        ph_or[stage] ^= 1
+                        ptx.mbarrier.wait(
+                            base + BAR_O_RESC + 16 * stage + 8 * par,
+                            ph_or[stage][par],
+                        )
+                        ph_or[stage][par] ^= 1
                     ptx.tcgen05.fence_after_thread_sync()
                     for kk in range(4 * half, 4 * half + 4):
                         a = tmem + (TM_P[stage] + kk * 8)
@@ -383,6 +414,9 @@ def build_flash_attention_blackwell(
                             kind="f16", a_is_tmem=True,
                             pred_operand=(p_noacc if (first_accum and kk == 0) else p_acc),
                         )
+                # deferred-rescale handshake: correction may only touch O
+                # after this tile's PV has fully accumulated
+                ptx.tcgen05.commit(base + BAR_PV_DONE + 8 * stage)
 
             # ---- prologue: Q ready, K0 ready -> S(0) both stages ----
             ph_qa = reg.scalar(b32, init=0)
@@ -396,10 +430,10 @@ def build_flash_attention_blackwell(
 
             # ---- peeled j=0: PV(0) with V slot 1, then S(1) with K slot 2 ----
             wait_kv(1)
-            pv_mma(0, 0, first_accum=True)
+            pv_mma(0, 0, first_accum=True, par=0)
             wait_kv(2)
             qk_mma(0, 1)
-            pv_mma(1, 0, first_accum=True)
+            pv_mma(1, 0, first_accum=True, par=0)
             qk_mma(1, 1)
             ptx.tcgen05.commit(base + BAR_KV_FREE + 8 * 2)
             ptx.tcgen05.commit(base + BAR_KV_FREE + 8 * 1)
@@ -414,7 +448,7 @@ def build_flash_attention_blackwell(
                     # j odd: V in slot 3, next K in slot 0
                     wait_kv(3)
                     for stage in range(Q_STAGE):
-                        pv_mma(stage, 1, first_accum=False)
+                        pv_mma(stage, 1, first_accum=False, par=1)
                         if stage == 0:
                             wait_kv(0)
                         qk_mma(stage, 0)
@@ -423,7 +457,7 @@ def build_flash_attention_blackwell(
                     # j even: V in slot 1, next K in slot 2
                     wait_kv(1)
                     for stage in range(Q_STAGE):
-                        pv_mma(stage, 0, first_accum=False)
+                        pv_mma(stage, 0, first_accum=False, par=0)
                         if stage == 0:
                             wait_kv(2)
                         qk_mma(stage, 1)
@@ -435,8 +469,15 @@ def build_flash_attention_blackwell(
             # ---- peeled j = n_tiles-1 (odd): PV only, V in slot 3 ----
             wait_kv(3)
             for stage in range(Q_STAGE):
-                pv_mma(stage, 1, first_accum=False)
+                pv_mma(stage, 1, first_accum=False, par=1)
             ptx.tcgen05.commit(base + BAR_O_DONE)
+            # tail padding: correction's PV_DONE parity waits may lag the
+            # completion stream by 2 while idling through skip tiles; two
+            # extra completions per stage guarantee every pending parity
+            # test still sees a phase flip after the last real PV
+            for _ in range(2):
+                for stage in range(Q_STAGE):
+                    ptx.tcgen05.commit(base + BAR_PV_DONE + 8 * stage)
 
         # =================================================================
         # Softmax pool (tids 0-255): all 8 warps cooperate on one S subtile.
@@ -456,9 +497,19 @@ def build_flash_attention_blackwell(
             ptx.inst.shr.u32(p_word_base, col_base, 1)   # 0 or 32
 
             qk_scale_reg = reg.scalar(f32, init=qk_scale)
-            neg_thresh = reg.scalar(f32, init=-rescale_threshold)
+            # stale-basis softmax: P is exp'd against the pending per-row
+            # basis with no tile max in front. The basis only moves when a
+            # tile's exp'd max exceeds 2^rescale_threshold, so P stays
+            # bounded by 2^thresh and the O rescale (deferred one tile)
+            # fires rarely.
+            thresh_p = reg.scalar(f32, init=float(2.0 ** rescale_threshold))
             one_f = reg.scalar(f32, init=1.0)
-            m_run = [reg.scalar(f32, init=-1e30) for _ in range(Q_STAGE)]
+            # mneg[s] = -(basis * qk_scale): exp arg is fma(x, qk, mneg)
+            mneg = [reg.scalar(f32, init=0.0) for _ in range(Q_STAGE)]
+            # tile k's max/sum are carried into tile k+1's body, where the
+            # basis decision and l-update run hidden under the S load
+            pmax_pend = [reg.scalar(f32, init=0.0) for _ in range(Q_STAGE)]
+            sums_pend = [reg.scalar(f32, init=0.0) for _ in range(Q_STAGE)]
             l_run = [reg.scalar(f32, init=0.0) for _ in range(Q_STAGE)]
             if emu_pairs:
                 clamp_f = reg.scalar(f32, init=EX2_CLAMP)
@@ -507,7 +558,8 @@ def build_flash_attention_blackwell(
                     ptx.inst.add.u32(sum_addr[s], row_b, base + SMEM_STATS + 1024 + s * 512)
                     ptx.inst.add.u32(sum_addr[s], sum_addr[s], half_sel)
                     ptx.inst.add.u32(sum_addr[s], sum_addr[s], half_sel)
-                    ptx.inst.add.u32(xchg_mine[s], row_b, base + SMEM_STATS + 3072 + s * 1024)
+                    # parity offset (0/1024) is added at use sites
+                    ptx.inst.add.u32(xchg_mine[s], row_b, base + SMEM_STATS + 3072 + s * 2048)
                     ptx.inst.add.u32(xchg_other[s], xchg_mine[s], other_sel)
                     ptx.inst.add.u32(xchg_mine[s], xchg_mine[s], half_sel)
 
@@ -658,46 +710,55 @@ def build_flash_attention_blackwell(
                 else:
                     ptx.inst.fma.rn.f32(l_run[stage], l_run[stage], alpha, sums)
 
-            def body(stage: int, is_first: bool):
+            def body(stage: int, is_first: bool, pxc=None, pxp=None, po=None):
                 if s_f16:
-                    body_f16(stage, is_first)
-                    return
+                    # parked experimental path; predates the stale-basis
+                    # softmax and still expects the old m_run protocol
+                    raise NotImplementedError(
+                        "s_f16 is parked and incompatible with the "
+                        "stale-basis softmax"
+                    )
                 ptx.mbarrier.wait(base + BAR_S_FULL + 8 * stage, ph_s[stage])
                 ptx.inst.xor.b32(ph_s[stage], ph_s[stage], 1)
                 ptx.tcgen05.fence_after_thread_sync()
 
+                # issue the S load, then run the PREVIOUS tile's deferred
+                # basis maintenance in its latency shadow
                 ptx.tcgen05.ld(vals, s_addr[stage], shape="32x32b", count=64, dtype="b32")
-                ptx.tcgen05.wait_ld()
-                pmax = reg.scalar(f32)
-                tile_max(pmax)
 
-                # exchange partial maxima with the paired warp
-                ptx.inst.st.shared.b32(ptx.addr(xchg_mine[stage]), pmax)
-                ptx.bar.sync(pair_bar, 64)
-                other = smem.load(b32, ptx.addr(xchg_other[stage]))
-                other_f = reg.scalar(f32)
-                ptx.inst.mov.b32(other_f, other)
-                ptx.inst.max.f32(pmax, pmax, other_f)
+                if not is_first:
+                    # ---- deferred tail of tile k-1 ----
+                    ptx.bar.sync(pair_bar, 64)
+                    if pxp is None:
+                        oaddr = xchg_other[stage]
+                    else:
+                        oaddr = reg.scalar(u32)
+                        ptx.inst.add.u32(oaddr, xchg_other[stage], pxp)
+                    other = smem.load(b32, ptx.addr(oaddr))
+                    other_f = reg.scalar(f32)
+                    ptx.inst.mov.b32(other_f, other)
+                    pmax = reg.scalar(f32)
+                    ptx.inst.max.f32(pmax, pmax_pend[stage], other_f)
 
-                alpha = reg.scalar(f32)
-                if is_first:
-                    ptx.inst.mov.f32(m_run[stage], pmax)
-                else:
-                    m_new = reg.scalar(f32)
-                    ptx.inst.max.f32(m_new, m_run[stage], pmax)
-                    d = reg.scalar(f32)
-                    ptx.inst.sub.f32(d, m_run[stage], m_new)
-                    ptx.inst.mul.f32(d, d, qk_scale_reg)
-                    keep = reg.scalar(pred)
-                    ptx.inst.setp.ge.f32(keep, d, neg_thresh)
-                    with ptx.if_(keep):
-                        ptx.inst.mov.f32(alpha, one_f)
-                    with ptx.else_():
-                        ptx.inst.ex2.approx.ftz.f32(alpha, d)
-                        ptx.inst.mov.f32(m_run[stage], m_new)
+                    alpha = reg.scalar(f32)
+                    ptx.inst.mov.f32(alpha, one_f)
+                    move = reg.scalar(pred)
+                    ptx.inst.setp.gt.f32(move, pmax, thresh_p)
+                    with ptx.if_(move):
+                        # snap basis to the previous tile's max: alpha =
+                        # 1/pmax matches the shift applied via mneg
+                        ptx.inst.rcp.approx.f32(alpha, pmax)
+                        lgp = reg.scalar(f32)
+                        ptx.inst.lg2.approx.f32(lgp, pmax)
+                        ptx.inst.sub.f32(mneg[stage], mneg[stage], lgp)
+
+                    # l joins tile k-1's sums, then moves to the new basis
+                    ptx.inst.add.f32(l_run[stage], l_run[stage], sums_pend[stage])
+                    ptx.inst.mul.f32(l_run[stage], l_run[stage], alpha)
+
+                    # publish alpha_{k-1}: it gates PV(k) (parity k&1) and
+                    # the O rescale runs between PV(k-1) and PV(k)
                     with ptx.if_(is_a):
-                        # correction must have consumed the previous alpha;
-                        # in steady state this wait is already satisfied
                         ptx.mbarrier.wait(
                             base + BAR_STATS_FREE + 8 * stage, ph_stats[stage]
                         )
@@ -715,12 +776,18 @@ def build_flash_attention_blackwell(
                         ptx.inst.vote.sync.ballot.b32(blt, needs, 0xFFFFFFFF)
                         all_skip = reg.scalar(pred)
                         ptx.inst.setp.eq.b32(all_skip, blt, 0)
-                        ptx.mbarrier.arrive(base + BAR_O_RESC + 8 * stage, pred=all_skip)
+                        if po is None:
+                            ora = base + BAR_O_RESC + 16 * stage + 8
+                        else:
+                            ora = reg.scalar(u32)
+                            ptx.inst.add.u32(ora, po, base + BAR_O_RESC + 16 * stage)
+                        ptx.mbarrier.arrive(ora, pred=all_skip)
 
-                m_scaled = reg.scalar(f32)
-                ptx.inst.mul.f32(m_scaled, m_run[stage], qk_scale_reg)
-                ptx.inst.neg.f32(m_scaled, m_scaled)
+                ptx.tcgen05.wait_ld()
 
+                # stale basis: exp everything against the pending per-row
+                # basis immediately — no tile max in front of the exps
+                m_scaled = mneg[stage]
                 if emu_pairs:
                     m2 = reg.scalar(b64)
                     ptx.inst.mov.b64(m2, [m_scaled, m_scaled])
@@ -752,10 +819,7 @@ def build_flash_attention_blackwell(
                     ptx.inst.mov.b32(vals[i], r1)
                     ptx.inst.mov.b32(vals[i + 1], r2)
 
-                # exp + pack + store P in two 32-element chunks; each chunk
-                # is one quarter of P. A produces quarters 0,1; B: 2,3.
-                for chunk in range(2):
-                    off = chunk * 32
+                def exp_chunk(off):
                     for pair in range(16):
                         i = off + 2 * pair
                         if pair in emu_pairs:
@@ -765,16 +829,21 @@ def build_flash_attention_blackwell(
                         ptx.inst.ex2.approx.ftz.f32(vals[i], vals[i])
                         ptx.inst.fma.rn.f32(vals[i + 1], vals[i + 1], qk_scale_reg, m_scaled)
                         ptx.inst.ex2.approx.ftz.f32(vals[i + 1], vals[i + 1])
-                    for c in range(16):
-                        ptx.inst.cvt.rn.bf16x2.f32(
-                            packed[c], vals[off + 2 * c + 1], vals[off + 2 * c]
-                        )
-                    if chunk == 0:
-                        ptx.tcgen05.st(p_addr[stage], packed, shape="32x32b", count=16, dtype="b32")
-                    else:
-                        pa = reg.scalar(b32)
-                        ptx.inst.add.u32(pa, p_addr[stage], 16)
-                        ptx.tcgen05.st(pa, packed, shape="32x32b", count=16, dtype="b32")
+
+                # exp all 64 values, pack, and publish P as early as
+                # possible — nothing about maxima gates this path
+                exp_chunk(0)
+                for c in range(16):
+                    ptx.inst.cvt.rn.bf16x2.f32(packed[c], vals[2 * c + 1], vals[2 * c])
+                ptx.tcgen05.st(p_addr[stage], packed, shape="32x32b", count=16, dtype="b32")
+                exp_chunk(32)
+                for c in range(16):
+                    ptx.inst.cvt.rn.bf16x2.f32(
+                        packed[c], vals[32 + 2 * c + 1], vals[32 + 2 * c]
+                    )
+                pa = reg.scalar(b32)
+                ptx.inst.add.u32(pa, p_addr[stage], 16)
+                ptx.tcgen05.st(pa, packed, shape="32x32b", count=16, dtype="b32")
                 # one arrive per half: A -> quarter barrier 0, B -> 2
                 ptx.tcgen05.wait_st()
                 ptx.tcgen05.fence_before_thread_sync()
@@ -783,7 +852,20 @@ def build_flash_attention_blackwell(
                 ptx.inst.add.u32(qbar, qbar, base + BAR_P_Q + 32 * stage)
                 ptx.mbarrier.arrive(qbar)
 
-                # row-sum update (overlaps P@V)
+                # ---- carry this tile's max and sums into the next body ----
+                # tile max on the exp'd values; exp2 is monotonic, so
+                # pmax = 2^((max_x)*qk + mneg) and pmax > 2^thresh means the
+                # basis has drifted more than rescale_threshold behind. The
+                # exchange completes in the NEXT body, hidden under its S
+                # load; the store targets this tile's parity slot.
+                tile_max(pmax_pend[stage])
+                if pxc is None:
+                    maddr = xchg_mine[stage]
+                else:
+                    maddr = reg.scalar(u32)
+                    ptx.inst.add.u32(maddr, xchg_mine[stage], pxc)
+                ptx.inst.st.shared.b32(ptx.addr(maddr), pmax_pend[stage])
+
                 sums = reg.scalar(f32)
                 acc = [reg.scalar(f32) for _ in range(4)]
                 for a in range(4):
@@ -794,25 +876,37 @@ def build_flash_attention_blackwell(
                 ptx.inst.add.f32(acc[0], acc[0], acc[1])
                 ptx.inst.add.f32(acc[2], acc[2], acc[3])
                 ptx.inst.add.f32(sums, acc[0], acc[2])
-                if is_first:
-                    ptx.inst.mov.f32(l_run[stage], sums)
-                else:
-                    ptx.inst.fma.rn.f32(l_run[stage], l_run[stage], alpha, sums)
+                ptx.inst.mov.f32(sums_pend[stage], sums)
 
+            assert n_tiles >= 2, "stale-basis softmax needs n_tiles >= 2"
             for stage in range(Q_STAGE):
                 body(stage, is_first=True)
             it = reg.scalar(u32, init=1)
             go = reg.scalar(pred)
             ptx.inst.setp.lt.u32(go, it, n_tiles)
             with ptx.loop("softmax_loop", pred=go):
+                # parity-derived offsets: current tile's exchange slot,
+                # previous tile's slot, and PV(it)'s O_RESC parity barrier
+                tb = reg.scalar(u32)
+                ptx.inst.and_.b32(tb, it, 1)
+                pxc = reg.scalar(u32)
+                ptx.inst.shl.b32(pxc, tb, 10)
+                pxp = reg.scalar(u32)
+                ptx.inst.xor.b32(pxp, pxc, 1024)
+                po = reg.scalar(u32)
+                ptx.inst.shl.b32(po, tb, 3)
                 for stage in range(Q_STAGE):
-                    body(stage, is_first=False)
+                    body(stage, is_first=False, pxc=pxc, pxp=pxp, po=po)
                 it += 1
                 ptx.inst.setp.lt.u32(go, it, n_tiles)
 
-            # publish row sums: both halves write, pair-sync, then A arrives
-            # the stats barrier so correction sees both halves' sums.
+            # drain: fold the last tile's sums into l (its basis decision
+            # never runs — the pending rescale cancels between O and l in
+            # the epilogue normalize), then publish row sums: both halves
+            # write, pair-sync, then A arrives the stats barrier so
+            # correction sees both halves' sums.
             for s in range(Q_STAGE):
+                ptx.inst.add.f32(l_run[s], l_run[s], sums_pend[s])
                 ptx.inst.st.shared.b32(ptx.addr(sum_addr[s]), l_run[s])
             ptx.bar.sync(pair_bar, 64)
             with ptx.if_(is_a):
@@ -838,48 +932,65 @@ def build_flash_attention_blackwell(
                 ptx.inst.add.u32(o_addr[s], o_addr[s], TM_O[s])
                 ptx.inst.add.u32(o_addr[s], o_addr[s], lane_addr_bits)
 
-            # first KV tile needs no correction: release both stages once;
-            # also pre-arrive STATS_FREE so the softmax's pre-write wait at
-            # tile 1 is already satisfied
+            # first KV tile needs no correction: release both stages once
+            # (parity-0 barrier gates PV(0)); also pre-arrive STATS_FREE so
+            # the softmax's pre-write wait at tile 0 is already satisfied
             for s in range(Q_STAGE):
-                ptx.mbarrier.arrive(base + BAR_O_RESC + 8 * s)
+                ptx.mbarrier.arrive(base + BAR_O_RESC + 16 * s)
                 ptx.mbarrier.arrive(base + BAR_STATS_FREE + 8 * s)
 
             ovals = reg.array(f32, 64)
 
-            if n_tiles > 1:
-                it = reg.scalar(u32, init=1)
-                go = reg.scalar(pred)
-                ptx.inst.setp.lt.u32(go, it, n_tiles)
-                with ptx.loop("corr_loop", pred=go):
-                    for stage in range(Q_STAGE):
-                        ptx.bar.sync(stats_bar[stage], 64)
-                        alpha = reg.scalar(f32)
-                        av = smem.load(b32, ptx.addr(alpha_addr[stage]))
-                        ptx.inst.mov.b32(alpha, av)
-                        ptx.mbarrier.arrive(base + BAR_STATS_FREE + 8 * stage)
-                        need = reg.scalar(pred)
-                        ptx.inst.setp.lt.f32(need, alpha, one_f)
-                        ballot = reg.scalar(b32)
-                        ptx.inst.vote.sync.ballot.b32(ballot, need, 0xFFFFFFFF)
-                        any_need = reg.scalar(pred)
-                        ptx.inst.setp.ne.b32(any_need, ballot, 0)
-                        # softmax already released O_RESC when nothing rescales
-                        with ptx.if_(any_need):
-                            ptx.tcgen05.fence_after_thread_sync()
-                            for half in range(2):
-                                addr = reg.scalar(b32)
-                                ptx.inst.add.u32(addr, o_addr[stage], half * 64)
-                                ptx.tcgen05.ld(ovals, addr, shape="32x32b", count=64, dtype="b32")
-                                ptx.tcgen05.wait_ld()
-                                for i in range(64):
-                                    ptx.inst.mul.f32(ovals[i], ovals[i], alpha)
-                                ptx.tcgen05.st(addr, ovals, shape="32x32b", count=64, dtype="b32")
-                            ptx.tcgen05.wait_st()
-                            ptx.tcgen05.fence_before_thread_sync()
-                            ptx.mbarrier.arrive(base + BAR_O_RESC + 8 * stage)
-                    it += 1
-                    ptx.inst.setp.lt.u32(go, it, n_tiles)
+            # alpha published at tile i (i = 0..n_tiles-2; the last tile
+            # publishes nothing) rescales O between PV(i) and PV(i+1). The
+            # wait for PV(i)'s completion happens EVERY iteration
+            # (correction idles here anyway) so the phase var tracks the
+            # true completion count — a parity-only wait inside the rare
+            # branch could alias an older same-parity completion and race
+            # the in-flight PV.
+            ph_pv = [reg.scalar(b32, init=0) for _ in range(Q_STAGE)]
+            it = reg.scalar(u32, init=0)
+            go = reg.scalar(pred)
+            ptx.inst.setp.lt.u32(go, it, n_tiles - 1)
+            with ptx.loop("corr_loop", pred=go):
+                ponc = reg.scalar(u32)
+                ptx.inst.add.u32(ponc, it, 1)
+                ptx.inst.and_.b32(ponc, ponc, 1)
+                ptx.inst.shl.b32(ponc, ponc, 3)
+                for stage in range(Q_STAGE):
+                    ptx.bar.sync(stats_bar[stage], 64)
+                    alpha = reg.scalar(f32)
+                    av = smem.load(b32, ptx.addr(alpha_addr[stage]))
+                    ptx.inst.mov.b32(alpha, av)
+                    ptx.mbarrier.arrive(base + BAR_STATS_FREE + 8 * stage)
+                    ptx.mbarrier.wait(base + BAR_PV_DONE + 8 * stage, ph_pv[stage])
+                    ptx.inst.xor.b32(ph_pv[stage], ph_pv[stage], 1)
+                    need = reg.scalar(pred)
+                    ptx.inst.setp.lt.f32(need, alpha, one_f)
+                    ballot = reg.scalar(b32)
+                    ptx.inst.vote.sync.ballot.b32(ballot, need, 0xFFFFFFFF)
+                    any_need = reg.scalar(pred)
+                    ptx.inst.setp.ne.b32(any_need, ballot, 0)
+                    # softmax already released O_RESC when nothing rescales
+                    with ptx.if_(any_need):
+                        ptx.tcgen05.fence_after_thread_sync()
+                        for half in range(2):
+                            addr = reg.scalar(b32)
+                            ptx.inst.add.u32(addr, o_addr[stage], half * 64)
+                            ptx.tcgen05.ld(ovals, addr, shape="32x32b", count=64, dtype="b32")
+                            ptx.tcgen05.wait_ld()
+                            for i in range(64):
+                                ptx.inst.mul.f32(ovals[i], ovals[i], alpha)
+                            ptx.tcgen05.st(addr, ovals, shape="32x32b", count=64, dtype="b32")
+                        ptx.tcgen05.wait_st()
+                        ptx.tcgen05.fence_before_thread_sync()
+                        ora = reg.scalar(u32)
+                        ptx.inst.add.u32(
+                            ora, ponc, base + BAR_O_RESC + 16 * stage
+                        )
+                        ptx.mbarrier.arrive(ora)
+                it += 1
+                ptx.inst.setp.lt.u32(go, it, n_tiles - 1)
 
             # ---- epilogue: wait all PV done, normalize, store bf16 ----
             done_phase = reg.scalar(b32, init=0)
@@ -931,11 +1042,28 @@ def build_flash_attention_blackwell(
                         )
 
         ptx.bar.sync(0, 512)
+        if waitmap:
+            _wm_ctx.__exit__(None, None, None)
+            is_cta0 = reg.scalar(pred)
+            zx = reg.scalar(u32)
+            ptx.inst.or_.b32(zx, m_block, bh)
+            ptx.inst.setp.eq.u32(is_cta0, zx, 0)
+            wm.flush(pred=is_cta0)
         with ptx.if_(alloc_warp):
             ptx.tcgen05.dealloc(tmem, 512)
             ptx.tcgen05.relinquish_alloc_permit()
         ptx.ret()
 
+    if waitmap:
+        @kernel(**kernel_kwargs)
+        def flash_attn_fwd(Q, K, V, O, WM):
+            _fa_body(Q, K, V, O, WM)
+    else:
+        @kernel(**kernel_kwargs)
+        def flash_attn_fwd(Q, K, V, O):
+            _fa_body(Q, K, V, O, None)
+
+    flash_attn_fwd._waitmap = wm  # decoder access for tooling
     return flash_attn_fwd
 
 

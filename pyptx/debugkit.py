@@ -225,3 +225,147 @@ class DebugKit:
 def n_slot_words(n_slots: int) -> int:
     """Total b32 words to allocate for a debug buffer of n_slots."""
     return n_slots * SLOT_WORDS
+
+
+# =====================================================================
+# WaitMap: trace-time auto-instrumentation of barrier waits
+# =====================================================================
+
+WAITMAP_MAX_SITES = 16
+
+
+@dataclass
+class WaitMap:
+    """Wraps every ``ptx.mbarrier.wait`` and ``ptx.bar.sync`` emitted while
+    active, accumulating per-site %clock cycles into per-thread counters.
+    Sites are auto-named from the caller's source line, so kernels need no
+    source changes beyond attach/flush.
+
+    Usage in a builder::
+
+        wm = WaitMap()
+        ...
+        def body(...):
+            if wm_enabled:
+                wm.attach_flush_late(...)  # see attach()/flush()
+            with wm.active():
+                ...   # trace the kernel body; waits get instrumented
+
+    Buffer layout: row per thread (tid), WAITMAP_MAX_SITES words per row.
+    """
+
+    _sites: list = field(default_factory=list)
+    _accs: dict = field(default_factory=dict)
+    _ptr: Any = None
+    _row_off: Any = None
+
+    def site_names(self) -> list:
+        return list(self._sites)
+
+    def attach(self, dbg_ptr: Any, tid_reg: Any) -> None:
+        from pyptx import ptx, reg
+        from pyptx.types import u32, u64
+
+        self._ptr = dbg_ptr
+        off = reg.scalar(u64)
+        ptx.inst.mul.wide.u32(off, tid_reg, WAITMAP_MAX_SITES * 4)
+        self._row_off = off
+        # pre-create every accumulator here, in the uniform entry region:
+        # a lazily created reg would get its zero-init emitted inside
+        # whichever role branch first hit the site, leaving other roles'
+        # threads accumulating into garbage
+        for sid in range(WAITMAP_MAX_SITES):
+            self._accs[sid] = reg.scalar(u32, init=0)
+
+    def _site_id(self) -> int:
+        import inspect
+
+        for fr in inspect.stack()[2:8]:
+            fn = fr.filename
+            if "debugkit" in fn or "/ptx.py" in fn:
+                continue
+            name = f"{fn.rsplit('/', 1)[-1].removesuffix('.py')}:{fr.lineno}"
+            break
+        else:
+            name = f"site{len(self._sites)}"
+        if name not in self._sites:
+            if len(self._sites) >= WAITMAP_MAX_SITES:
+                return -1
+            self._sites.append(name)
+        return self._sites.index(name)
+
+    def _wrap(self, emit_fn, args, kwargs) -> None:
+        from pyptx import ptx, reg
+        from pyptx.types import u32
+
+        sid = self._site_id()
+        if sid < 0 or sid not in self._accs:
+            emit_fn(*args, **kwargs)
+            return
+        t0 = reg.scalar(u32)
+        ptx.inst.mov.u32(t0, ptx.special.clock())
+        emit_fn(*args, **kwargs)
+        t1 = reg.scalar(u32)
+        ptx.inst.mov.u32(t1, ptx.special.clock())
+        ptx.inst.sub.u32(t1, t1, t0)
+        ptx.inst.add.u32(self._accs[sid], self._accs[sid], t1)
+
+    def active(self):
+        """Context manager: instrument waits emitted inside."""
+        from contextlib import contextmanager
+
+        @contextmanager
+        def _cm():
+            from pyptx import ptx
+
+            orig_wait = ptx.mbarrier.wait
+            orig_sync = ptx.bar.sync
+            wm = self
+
+            def wait_hook(*a, **k):
+                wm._wrap(orig_wait, a, k)
+
+            def sync_hook(*a, **k):
+                wm._wrap(orig_sync, a, k)
+
+            ptx.mbarrier.wait = wait_hook
+            ptx.bar.sync = sync_hook
+            try:
+                yield self
+            finally:
+                ptx.mbarrier.wait = orig_wait
+                ptx.bar.sync = orig_sync
+
+        return _cm()
+
+    def flush(self, pred: Any = None) -> None:
+        """Write all site counters for this thread (guard with a pred that
+        selects one CTA to keep the buffer small)."""
+        from pyptx import ptx
+
+        if self._ptr is None:
+            raise RuntimeError("WaitMap.flush before attach()")
+        for sid, acc in sorted(self._accs.items()):
+            ptx.inst.st.global_.b32(
+                ptx.addr(self._ptr + self._row_off, 4 * sid), acc, pred=pred
+            )
+
+    def decode(self, dbg_tensor, n_threads: int = 512, roles: dict | None = None) -> dict:
+        """Aggregate per-site cycles by role. roles: {name: (lo_tid, hi_tid)}."""
+        import numpy as np
+
+        w = np.ascontiguousarray(
+            dbg_tensor.detach().cpu().view(-1).numpy()
+        ).view(np.uint32).reshape(-1, WAITMAP_MAX_SITES)[:n_threads]
+        roles = roles or {"all": (0, n_threads)}
+        out = {}
+        for sid, name in enumerate(self._sites):
+            row = {}
+            for rname, (lo, hi) in roles.items():
+                seg = w[lo:hi, sid]
+                nz = seg[seg > 0]
+                if len(nz):
+                    row[rname] = int(nz.mean())
+            if row:
+                out[name] = row
+        return out
