@@ -1,0 +1,2185 @@
+"""Blackwell tcgen05 FlashAttention forward (bf16, head_dim 128).
+
+Warp-specialized sm_100a attention forward. The architecture follows
+FlashAttention-4 / CUTLASS 77_blackwell_fmha, with a pyptx twist in how the
+softmax work is laid out:
+
+- 256 query rows per CTA as two 128-row subtiles ("stages"), BN=128 KV tile
+- ``tcgen05.mma`` computes S = Q@K^T into TMEM; P@V accumulates onto O in
+  TMEM with the A operand sourced directly from TMEM
+- **column-split softmax pool**: all 8 softmax warps work on one S subtile
+  at a time. Warp w (rows 32w..32w+31, columns 0-63) pairs with warp w+4
+  (same rows, columns 64-127). Partial row maxima are exchanged through
+  shared memory at a per-warp-pair named barrier, then each side exps,
+  packs bf16, and stores its own quarter of P. This halves the S -> P
+  latency compared to one warpgroup per stage and lets P@V start after the
+  first 16 P columns land (4-way split-P).
+- 16 warps: softmax pool (w0-7), correction (w8-11), MMA dispatch (w12),
+  TMA load (w14); w13/w15 idle
+- K/V staged through a 4-slot SMEM ring (K,V alternating) fed by TMA
+- correction warps rescale O in TMEM only when the running row max moves by
+  more than ``RESCALE_THRESHOLD`` in scaled-log2 units (FA4 "skip
+  correction"). In the common no-rescale case the softmax warps release the
+  O barrier themselves so the correction round-trip stays off the critical
+  path; the correction warps re-derive the same per-warp ballot from the
+  alphas in shared memory, so barrier arrival counts stay exact.
+- epilogue: correction warps normalize O by the row sum and store bf16
+
+TMEM layout (512 columns of 32-bit):
+
+    cols   0-127   S0 (f32) — P0 (packed bf16) overwrites cols 0-63
+    cols 128-255   S1 (f32) — P1 overwrites cols 128-191
+    cols 256-383   O0 (f32 accumulator)
+    cols 384-511   O1 (f32 accumulator)
+
+Tensors are passed 2D as (batch*heads*seqlen, head_dim), i.e. a contiguous
+(B, H, S, D) view. grid = (seqlen//256, batch*heads).
+"""
+from __future__ import annotations
+
+import math
+
+from pyptx import Tile, kernel, ptx, reg, smem
+from pyptx.specs import Layout
+from pyptx.types import b32, b64, bf16, f32, pred, u32, u64
+
+LOG2E = 1.4426950408889634
+
+BM = 128          # rows per Q subtile
+Q_STAGE = 2       # subtiles per CTA -> 256 rows
+BN = 128          # KV tile size
+HD = 128          # head dim (v1: fixed 128)
+KV_SLOTS = 4      # SMEM ring slots, each one K or V tile
+
+TILE_BYTES = BN * HD * 2          # 32 KB per K/V/Q tile
+STRIPE_BYTES = 16384              # TMA 128B-swizzle stripe: 128 rows x 64 cols bf16
+Q_BYTES = Q_STAGE * TILE_BYTES
+SLOT_UNITS = TILE_BYTES // 16     # ring-slot stride in 16B descriptor units
+
+# SMEM map (bytes)
+SMEM_Q = 0
+SMEM_KV = SMEM_Q + Q_BYTES                    # 65536
+SMEM_STATS = SMEM_KV + KV_SLOTS * TILE_BYTES  # 196608
+#   alpha[2][128]   @ +0     (stage-major, f32)
+#   sumA[2][128]    @ +1024
+#   sumB[2][128]    @ +2048
+#   xchg[2][2][128] @ +3072  (stage, half, row)
+SMEM_BARS = SMEM_STATS + 5120                 # 201728
+BAR_Q = SMEM_BARS + 0             # 2 x 8
+BAR_KV_FULL = SMEM_BARS + 16      # 4 x 8
+BAR_KV_FREE = SMEM_BARS + 48      # 4 x 8
+BAR_S_FULL = SMEM_BARS + 80       # 2 x 8
+BAR_P_Q = SMEM_BARS + 96          # 2 stages x 4 quarters x 8 = 64
+BAR_O_RESC = SMEM_BARS + 160      # 2 x 8
+BAR_O_DONE = SMEM_BARS + 176      # 8
+BAR_STATS_FREE = SMEM_BARS + 184  # 2 x 8
+SMEM_TMEM_SLOT = SMEM_BARS + 208
+SMEM_BYTES = SMEM_TMEM_SLOT + 16
+
+# TMEM columns
+TM_S = (0, 128)
+TM_P = (0, 128)      # P overwrites the low half of S
+TM_O = (256, 384)
+
+# FA4-style skip-correction threshold, in scaled log2 units.
+RESCALE_THRESHOLD = 8.0
+
+# Constants for the FMA-pipe exp2 emulation (degree-3 polynomial, FA4's
+# add.rm floor trick). Bit-exact f32 values.
+import struct as _struct
+
+def _f32c(hexval: str) -> float:
+    return _struct.unpack(">f", bytes.fromhex(hexval))[0]
+
+EX2_BIG = _f32c("4B400000")     # 2^23 + 2^22
+EX2_CLAMP = _f32c("C2FE0000")   # -127.0
+EX2_C3 = _f32c("3D9DF09D")
+EX2_C2 = _f32c("3E6906A4")
+EX2_C1 = _f32c("3F31F519")
+EX2_C0 = _f32c("3F800000")
+
+MMA_TID = 384        # warp 12 lane 0
+LOAD_TID = 448       # warp 14 lane 0
+
+
+def _kmajor_desc_off(kk: int) -> int:
+    """Descriptor offset (16B units) for k-atom kk of a K-major 128-col bf16 tile.
+
+    The tile is stored as two TMA swizzle stripes of 128 rows x 128 bytes;
+    k-atoms 0-3 live in stripe 0 (+32B each), 4-7 in stripe 1 (+16KB).
+    """
+    return (kk // 4) * 1024 + (kk % 4) * 2
+
+
+def build_flash_attention_blackwell(
+    seqlen: int,
+    batch_heads: int,
+    head_dim: int = 128,
+    *,
+    sm_scale: float | None = None,
+    arch: str = "sm_100a",
+    rescale_threshold: float = RESCALE_THRESHOLD,
+    emu_pairs: tuple = (1, 3, 5, 7, 9, 11, 13, 15),
+):
+    assert head_dim == HD, "v1 supports head_dim=128 only"
+    assert seqlen % (Q_STAGE * BM) == 0, f"seqlen must be a multiple of 256, got {seqlen}"
+    n_tiles = seqlen // BN
+    assert n_tiles % 2 == 0
+    if sm_scale is None:
+        sm_scale = 1.0 / math.sqrt(head_dim)
+    qk_scale = sm_scale * LOG2E
+    total_rows = batch_heads * seqlen
+
+    @kernel(
+        in_specs=(
+            Tile(total_rows, HD, bf16, Layout.TMA_128B, tma_box=(BM, 64)),
+            Tile(total_rows, HD, bf16, Layout.TMA_128B, tma_box=(BN, 64)),
+            Tile(total_rows, HD, bf16, Layout.TMA_128B, tma_box=(BN, 64)),
+        ),
+        out_specs=(Tile(total_rows, HD, bf16, Layout.ROW),),
+        grid=(seqlen // (Q_STAGE * BM), batch_heads, 1),
+        block=(512, 1, 1),
+        arch=arch,
+        smem=SMEM_BYTES,
+        extern_smem=True,
+        reqntid=(512, 1, 1),
+    )
+    def flash_attn_fwd(Q, K, V, O):
+        base = smem.base()
+        tid = reg.scalar(u32); ptx.inst.mov.u32(tid, ptx.special.tid.x())
+        m_block = reg.scalar(u32); ptx.inst.mov.u32(m_block, ptx.special.ctaid.x())
+        bh = reg.scalar(u32); ptx.inst.mov.u32(bh, ptx.special.ctaid.y())
+
+        warp = tid >> 5
+        row128 = reg.scalar(u32); ptx.inst.and_.b32(row128, tid, 127)
+        # TMEM lane bits for this thread's warp: lanes (warp%4)*32
+        lane_addr_bits = reg.scalar(u32)
+        ptx.inst.and_.b32(lane_addr_bits, tid, 96)
+        ptx.inst.shl.b32(lane_addr_bits, lane_addr_bits, 16)
+        warp_in_group = reg.scalar(u32)
+        ptx.inst.and_.b32(warp_in_group, warp, 3)
+
+        is_softmax = reg.scalar(pred); ptx.inst.setp.lt.u32(is_softmax, tid, 256)
+        is_correction = reg.scalar(pred)
+        with ptx.scope():
+            ge = reg.scalar(pred); lt = reg.scalar(pred)
+            ptx.inst.setp.ge.u32(ge, tid, 256)
+            ptx.inst.setp.lt.u32(lt, tid, 384)
+            ptx.inst.and_.pred(is_correction, ge, lt)
+        is_mma = reg.scalar(pred); ptx.inst.setp.eq.u32(is_mma, tid, MMA_TID)
+        is_load = reg.scalar(pred); ptx.inst.setp.eq.u32(is_load, tid, LOAD_TID)
+        alloc_warp = reg.scalar(pred)
+        ptx.inst.setp.eq.u32(alloc_warp, warp, 12)
+
+        # Global row bases: Q rows for this CTA, KV rows for this (batch,head).
+        q_row0 = reg.scalar(u32)
+        ptx.inst.mul.lo.u32(q_row0, bh, seqlen)
+        kv_row0 = reg.scalar(u32)
+        ptx.inst.mov.u32(kv_row0, q_row0)
+        with ptx.scope():
+            mb_rows = reg.scalar(u32)
+            ptx.inst.mul.lo.u32(mb_rows, m_block, Q_STAGE * BM)
+            ptx.inst.add.u32(q_row0, q_row0, mb_rows)
+
+        # ---- init barriers, allocate TMEM ----
+        with ptx.if_(tid == 0):
+            for i in range(2):
+                ptx.mbarrier.init(base + BAR_Q + 8 * i, 1)
+                ptx.mbarrier.init(base + BAR_S_FULL + 8 * i, 1)
+                ptx.mbarrier.init(base + BAR_O_RESC + 8 * i, 128)
+                ptx.mbarrier.init(base + BAR_STATS_FREE + 8 * i, 128)
+                for qtr in range(4):
+                    ptx.mbarrier.init(base + BAR_P_Q + 32 * i + 8 * qtr, 128)
+            for s in range(KV_SLOTS):
+                ptx.mbarrier.init(base + BAR_KV_FULL + 8 * s, 1)
+                ptx.mbarrier.init(base + BAR_KV_FREE + 8 * s, 1)
+            ptx.mbarrier.init(base + BAR_O_DONE, 1)
+            ptx.fence.proxy_async_shared_cta()
+        with ptx.if_(alloc_warp):
+            ptx.tcgen05.alloc(base + SMEM_TMEM_SLOT, 512)
+        ptx.bar.sync(0, 512)
+        tmem = smem.load(b32, ptx.addr(base + SMEM_TMEM_SLOT))
+
+        # Register-file repartition. setmaxnreg is warpgroup-collective, so
+        # each aligned warpgroup executes its own dec/inc at the top of its
+        # role block. 136*256 + 88*128 + 152*128 = 65536.
+        NREG_SOFTMAX = 136
+        NREG_CORR = 88
+        NREG_OTHER = 152
+
+        # =================================================================
+        # TMA load warp (single lane; warpgroup 12-15 takes NREG_OTHER)
+        # =================================================================
+        is_other_wg = reg.scalar(pred)
+        ptx.inst.setp.ge.u32(is_other_wg, tid, 384)
+        with ptx.if_(is_other_wg):
+            ptx.setmaxnreg(NREG_OTHER, inc=True)
+
+        with ptx.if_(is_load):
+            def load_tile(dst_off: int, tensor, row_reg, mbar_off: int):
+                for stripe in range(2):
+                    ptx.cp.async_.bulk.tensor_2d(
+                        dst=base + dst_off + stripe * STRIPE_BYTES,
+                        src=tensor.tma_desc(),
+                        coord=(stripe * 64, row_reg),
+                        mbar=base + mbar_off,
+                    )
+
+            q_row1 = reg.scalar(u32)
+            ptx.inst.add.u32(q_row1, q_row0, BM)
+            ptx.mbarrier.arrive_expect_tx(base + BAR_Q + 0, TILE_BYTES)
+            load_tile(SMEM_Q, Q, q_row0, BAR_Q + 0)
+            ptx.mbarrier.arrive_expect_tx(base + BAR_Q + 8, TILE_BYTES)
+            load_tile(SMEM_Q + TILE_BYTES, Q, q_row1, BAR_Q + 8)
+
+            krow = reg.scalar(u32); ptx.inst.mov.u32(krow, kv_row0)
+            vrow = reg.scalar(u32); ptx.inst.mov.u32(vrow, kv_row0)
+
+            def load_kv(slot: int, tensor, row_reg):
+                ptx.mbarrier.arrive_expect_tx(base + BAR_KV_FULL + 8 * slot, TILE_BYTES)
+                load_tile(SMEM_KV + slot * TILE_BYTES, tensor, row_reg, BAR_KV_FULL + 8 * slot)
+                ptx.inst.add.u32(row_reg, row_reg, BN)
+
+            # prologue: fill the ring (K0 V0 K1 V1)
+            load_kv(0, K, krow)
+            load_kv(1, V, vrow)
+            load_kv(2, K, krow)
+            load_kv(3, V, vrow)
+
+            # steady state: 4 loads per trip into slots 0..3
+            trips = (n_tiles - 2) // 2
+            if trips > 0:
+                free_phase = [reg.scalar(b32, init=0) for _ in range(KV_SLOTS)]
+                trip = reg.scalar(u32, init=0)
+                go = reg.scalar(pred)
+                ptx.inst.setp.lt.u32(go, trip, trips)
+                with ptx.loop("kv_load_loop", pred=go):
+                    for slot, tensor, row_reg in (
+                        (0, K, krow), (1, V, vrow), (2, K, krow), (3, V, vrow),
+                    ):
+                        ptx.mbarrier.wait(base + BAR_KV_FREE + 8 * slot, free_phase[slot])
+                        free_phase[slot] ^= 1
+                        load_kv(slot, tensor, row_reg)
+                    trip += 1
+                    ptx.inst.setp.lt.u32(go, trip, trips)
+
+        # =================================================================
+        # MMA dispatch warp (single thread). All operand descriptors are
+        # loop-invariant and precomputed into registers.
+        # =================================================================
+        with ptx.if_(is_mma):
+            idesc_qk = reg.scalar(
+                b32,
+                init=ptx.tcgen05.make_instr_desc_f16bf16_f32(
+                    m=128, n=BN, ab_dtype="bf16", a_major="K", b_major="K"
+                ),
+            )
+            idesc_pv = reg.scalar(
+                b32,
+                init=ptx.tcgen05.make_instr_desc_f16bf16_f32(
+                    m=128, n=HD, ab_dtype="bf16", a_major="K", b_major="MN"
+                ),
+            )
+            p_acc = reg.scalar(pred)
+            p_noacc = reg.scalar(pred)
+            with ptx.scope():
+                one = reg.scalar(u32, init=1)
+                zero = reg.scalar(u32, init=0)
+                ptx.inst.setp.ne.b32(p_acc, one, 0)
+                ptx.inst.setp.ne.b32(p_noacc, zero, 0)
+
+            dq0 = ptx.tcgen05.masked_descriptor(base + SMEM_Q)
+            dk0 = ptx.tcgen05.masked_descriptor(base + SMEM_KV)
+            dv0 = ptx.tcgen05.descriptor(
+                base + SMEM_KV + TILE_BYTES,
+                stride_bytes=1024, leading_bytes=16384, swizzle="128B",
+            )
+
+            def derive(base_desc, off_units):
+                if off_units == 0:
+                    return base_desc
+                d = reg.scalar(b64)
+                ptx.inst.add.s64(d, base_desc, off_units)
+                return d
+
+            # [stage][kk] / [slot_idx][kk] descriptor registers, hoisted
+            desc_q = [
+                [derive(dq0, s * SLOT_UNITS + _kmajor_desc_off(kk)) for kk in range(8)]
+                for s in range(Q_STAGE)
+            ]
+            desc_k = [
+                [derive(dk0, k_idx * 2 * SLOT_UNITS + _kmajor_desc_off(kk)) for kk in range(8)]
+                for k_idx in range(2)
+            ]
+            desc_v = [
+                [derive(dv0, v_idx * 2 * SLOT_UNITS + kk * 128) for kk in range(8)]
+                for v_idx in range(2)
+            ]
+
+            def qk_mma(stage: int, k_idx: int):
+                d = tmem + TM_S[stage]
+                for kk in range(8):
+                    ptx.tcgen05.mma(
+                        d, desc_q[stage][kk], desc_k[k_idx][kk], idesc_qk,
+                        kind="f16", pred_operand=(p_noacc if kk == 0 else p_acc),
+                    )
+                ptx.tcgen05.commit(base + BAR_S_FULL + 8 * stage)
+
+            ph_kv = [reg.scalar(b32, init=0) for _ in range(KV_SLOTS)]
+            ph_pq = [
+                [reg.scalar(b32, init=0) for _ in range(4)] for _ in range(Q_STAGE)
+            ]
+            ph_or = [reg.scalar(b32, init=0) for _ in range(Q_STAGE)]
+
+            def wait_kv(slot: int):
+                ptx.mbarrier.wait(base + BAR_KV_FULL + 8 * slot, ph_kv[slot])
+                ph_kv[slot] ^= 1
+
+            def pv_mma(stage: int, v_idx: int, first_accum: bool):
+                d = tmem + TM_O[stage]
+                for half in range(2):
+                    ptx.mbarrier.wait(
+                        base + BAR_P_Q + 32 * stage + 16 * half,
+                        ph_pq[stage][half],
+                    )
+                    ph_pq[stage][half] ^= 1
+                    if half == 0:
+                        ptx.mbarrier.wait(base + BAR_O_RESC + 8 * stage, ph_or[stage])
+                        ph_or[stage] ^= 1
+                    ptx.tcgen05.fence_after_thread_sync()
+                    for kk in range(4 * half, 4 * half + 4):
+                        a = tmem + (TM_P[stage] + kk * 8)
+                        ptx.tcgen05.mma(
+                            d, a, desc_v[v_idx][kk], idesc_pv,
+                            kind="f16", a_is_tmem=True,
+                            pred_operand=(p_noacc if (first_accum and kk == 0) else p_acc),
+                        )
+
+            # ---- prologue: Q ready, K0 ready -> S(0) both stages ----
+            ph_qa = reg.scalar(b32, init=0)
+            ph_qb = reg.scalar(b32, init=0)
+            ptx.mbarrier.wait(base + BAR_Q + 0, ph_qa)
+            ptx.mbarrier.wait(base + BAR_Q + 8, ph_qb)
+            wait_kv(0)
+            qk_mma(0, 0)
+            qk_mma(1, 0)
+            ptx.tcgen05.commit(base + BAR_KV_FREE + 0)
+
+            # ---- peeled j=0: PV(0) with V slot 1, then S(1) with K slot 2 ----
+            wait_kv(1)
+            pv_mma(0, 0, first_accum=True)
+            wait_kv(2)
+            qk_mma(0, 1)
+            pv_mma(1, 0, first_accum=True)
+            qk_mma(1, 1)
+            ptx.tcgen05.commit(base + BAR_KV_FREE + 8 * 2)
+            ptx.tcgen05.commit(base + BAR_KV_FREE + 8 * 1)
+
+            # ---- steady: j = 1 .. n_tiles-2, two iterations per trip ----
+            trips = (n_tiles - 2) // 2
+            if trips > 0:
+                trip = reg.scalar(u32, init=0)
+                go = reg.scalar(pred)
+                ptx.inst.setp.lt.u32(go, trip, trips)
+                with ptx.loop("mma_loop", pred=go):
+                    # j odd: V in slot 3, next K in slot 0
+                    wait_kv(3)
+                    for stage in range(Q_STAGE):
+                        pv_mma(stage, 1, first_accum=False)
+                        if stage == 0:
+                            wait_kv(0)
+                        qk_mma(stage, 0)
+                    ptx.tcgen05.commit(base + BAR_KV_FREE + 8 * 0)
+                    ptx.tcgen05.commit(base + BAR_KV_FREE + 8 * 3)
+                    # j even: V in slot 1, next K in slot 2
+                    wait_kv(1)
+                    for stage in range(Q_STAGE):
+                        pv_mma(stage, 0, first_accum=False)
+                        if stage == 0:
+                            wait_kv(2)
+                        qk_mma(stage, 1)
+                    ptx.tcgen05.commit(base + BAR_KV_FREE + 8 * 2)
+                    ptx.tcgen05.commit(base + BAR_KV_FREE + 8 * 1)
+                    trip += 1
+                    ptx.inst.setp.lt.u32(go, trip, trips)
+
+            # ---- peeled j = n_tiles-1 (odd): PV only, V in slot 3 ----
+            wait_kv(3)
+            for stage in range(Q_STAGE):
+                pv_mma(stage, 1, first_accum=False)
+            ptx.tcgen05.commit(base + BAR_O_DONE)
+
+        # =================================================================
+        # Softmax pool (tids 0-255): all 8 warps cooperate on one S subtile.
+        # Warp w owns rows 32w..32w+31 cols 0-63; warp w+4 the same rows
+        # cols 64-127.
+        # =================================================================
+        with ptx.if_(is_softmax):
+            ptx.setmaxnreg(NREG_SOFTMAX, inc=True)
+
+            is_a = reg.scalar(pred)
+            ptx.inst.setp.lt.u32(is_a, tid, 128)
+            # column base: A -> 0, B -> 64 (S cols); P word base: A -> 0, B -> 32
+            col_base = reg.scalar(u32)
+            ptx.inst.and_.b32(col_base, tid, 128)
+            ptx.inst.shr.u32(col_base, col_base, 1)      # 0 or 64
+            p_word_base = reg.scalar(u32)
+            ptx.inst.shr.u32(p_word_base, col_base, 1)   # 0 or 32
+
+            qk_scale_reg = reg.scalar(f32, init=qk_scale)
+            neg_thresh = reg.scalar(f32, init=-rescale_threshold)
+            one_f = reg.scalar(f32, init=1.0)
+            m_run = [reg.scalar(f32, init=-1e30) for _ in range(Q_STAGE)]
+            l_run = [reg.scalar(f32, init=0.0) for _ in range(Q_STAGE)]
+            if emu_pairs:
+                clamp_f = reg.scalar(f32, init=EX2_CLAMP)
+                big_f = reg.scalar(f32, init=EX2_BIG)
+                c3_f = reg.scalar(f32, init=EX2_C3)
+                c2_f = reg.scalar(f32, init=EX2_C2)
+                c1_f = reg.scalar(f32, init=EX2_C1)
+                c0_f = reg.scalar(f32, init=EX2_C0)
+                big2 = reg.scalar(b64); ptx.inst.mov.b64(big2, [big_f, big_f])
+                c3_2 = reg.scalar(b64); ptx.inst.mov.b64(c3_2, [c3_f, c3_f])
+                c2_2 = reg.scalar(b64); ptx.inst.mov.b64(c2_2, [c2_f, c2_f])
+                c1_2 = reg.scalar(b64); ptx.inst.mov.b64(c1_2, [c1_f, c1_f])
+                c0_2 = reg.scalar(b64); ptx.inst.mov.b64(c0_2, [c0_f, c0_f])
+                qk2 = reg.scalar(b64)
+                ptx.inst.mov.b64(qk2, [qk_scale_reg, qk_scale_reg])
+
+            # S/P TMEM addresses per stage for this thread's half
+            s_addr = [reg.scalar(b32) for _ in range(Q_STAGE)]
+            p_addr = [reg.scalar(b32) for _ in range(Q_STAGE)]
+            for s in range(Q_STAGE):
+                ptx.inst.mov.b32(s_addr[s], tmem)
+                ptx.inst.add.u32(s_addr[s], s_addr[s], TM_S[s])
+                ptx.inst.add.u32(s_addr[s], s_addr[s], lane_addr_bits)
+                ptx.inst.add.u32(s_addr[s], s_addr[s], col_base)
+                ptx.inst.mov.b32(p_addr[s], tmem)
+                ptx.inst.add.u32(p_addr[s], p_addr[s], TM_P[s])
+                ptx.inst.add.u32(p_addr[s], p_addr[s], lane_addr_bits)
+                ptx.inst.add.u32(p_addr[s], p_addr[s], p_word_base)
+
+            # shared-memory addresses
+            alpha_addr = [reg.scalar(u32) for _ in range(Q_STAGE)]
+            sum_addr = [reg.scalar(u32) for _ in range(Q_STAGE)]
+            xchg_mine = [reg.scalar(u32) for _ in range(Q_STAGE)]
+            xchg_other = [reg.scalar(u32) for _ in range(Q_STAGE)]
+            with ptx.scope():
+                row_b = reg.scalar(u32)
+                ptx.inst.shl.b32(row_b, row128, 2)
+                half_sel = reg.scalar(u32)      # 0 for A, 512 for B
+                ptx.inst.and_.b32(half_sel, tid, 128)
+                ptx.inst.shl.b32(half_sel, half_sel, 2)
+                other_sel = reg.scalar(u32)
+                ptx.inst.xor.b32(other_sel, half_sel, 512)
+                for s in range(Q_STAGE):
+                    ptx.inst.add.u32(alpha_addr[s], row_b, base + SMEM_STATS + s * 512)
+                    # sumA at +1024+s*512, sumB at +2048+s*512
+                    ptx.inst.add.u32(sum_addr[s], row_b, base + SMEM_STATS + 1024 + s * 512)
+                    ptx.inst.add.u32(sum_addr[s], sum_addr[s], half_sel)
+                    ptx.inst.add.u32(sum_addr[s], sum_addr[s], half_sel)
+                    ptx.inst.add.u32(xchg_mine[s], row_b, base + SMEM_STATS + 3072 + s * 1024)
+                    ptx.inst.add.u32(xchg_other[s], xchg_mine[s], other_sel)
+                    ptx.inst.add.u32(xchg_mine[s], xchg_mine[s], half_sel)
+
+            pair_bar = reg.scalar(u32)   # named barrier 9+w: warps (w, w+4)
+            ptx.inst.add.u32(pair_bar, warp_in_group, 9)
+            stats_bar0 = reg.scalar(u32)  # named barrier per (stage, warp)
+            ptx.inst.add.u32(stats_bar0, warp_in_group, 1)
+
+            ph_s = [reg.scalar(b32, init=0) for _ in range(Q_STAGE)]
+            ph_stats = [reg.scalar(b32, init=0) for _ in range(Q_STAGE)]
+
+            vals = reg.array(f32, 64)
+            packed = reg.array(b32, 16)
+
+            def tile_max(dst):
+                # 3-input max over the thread's 64 columns
+                acc = [reg.scalar(f32) for _ in range(4)]
+                for a in range(4):
+                    ptx.inst.max.f32(acc[a], vals[a], vals[4 + a], vals[8 + a])
+                for i in range(12, 60, 8):
+                    for a in range(4):
+                        ptx.inst.max.f32(acc[a], acc[a], vals[i + a], vals[i + 4 + a])
+                for a in range(4):
+                    ptx.inst.max.f32(acc[a], acc[a], vals[60 + a])
+                ptx.inst.max.f32(acc[0], acc[0], acc[1], acc[2])
+                ptx.inst.max.f32(dst, acc[0], acc[3])
+
+            def body(stage: int, is_first: bool):
+                ptx.mbarrier.wait(base + BAR_S_FULL + 8 * stage, ph_s[stage])
+                ptx.inst.xor.b32(ph_s[stage], ph_s[stage], 1)
+                ptx.tcgen05.fence_after_thread_sync()
+
+                ptx.tcgen05.ld(vals, s_addr[stage], shape="32x32b", count=64, dtype="b32")
+                ptx.tcgen05.wait_ld()
+                pmax = reg.scalar(f32)
+                tile_max(pmax)
+
+                # exchange partial maxima with the paired warp
+                ptx.inst.st.shared.b32(ptx.addr(xchg_mine[stage]), pmax)
+                ptx.bar.sync(pair_bar, 64)
+                other = smem.load(b32, ptx.addr(xchg_other[stage]))
+                other_f = reg.scalar(f32)
+                ptx.inst.mov.b32(other_f, other)
+                ptx.inst.max.f32(pmax, pmax, other_f)
+
+                alpha = reg.scalar(f32)
+                if is_first:
+                    ptx.inst.mov.f32(m_run[stage], pmax)
+                else:
+                    m_new = reg.scalar(f32)
+                    ptx.inst.max.f32(m_new, m_run[stage], pmax)
+                    d = reg.scalar(f32)
+                    ptx.inst.sub.f32(d, m_run[stage], m_new)
+                    ptx.inst.mul.f32(d, d, qk_scale_reg)
+                    keep = reg.scalar(pred)
+                    ptx.inst.setp.ge.f32(keep, d, neg_thresh)
+                    with ptx.if_(keep):
+                        ptx.inst.mov.f32(alpha, one_f)
+                    with ptx.else_():
+                        ptx.inst.ex2.approx.ftz.f32(alpha, d)
+                        ptx.inst.mov.f32(m_run[stage], m_new)
+                    with ptx.if_(is_a):
+                        # correction must have consumed the previous alpha;
+                        # in steady state this wait is already satisfied
+                        ptx.mbarrier.wait(
+                            base + BAR_STATS_FREE + 8 * stage, ph_stats[stage]
+                        )
+                        ptx.inst.xor.b32(ph_stats[stage], ph_stats[stage], 1)
+                        ptx.inst.st.shared.b32(ptx.addr(alpha_addr[stage]), alpha)
+                        sb = reg.scalar(u32)
+                        ptx.inst.add.u32(sb, stats_bar0, stage * 4)
+                        ptx.inst.bar.arrive(sb, 64)
+                        # common case: no row in this warp rescales ->
+                        # release O_RESC directly (correction re-derives
+                        # the same ballot and stays silent)
+                        needs = reg.scalar(pred)
+                        ptx.inst.setp.lt.f32(needs, alpha, one_f)
+                        blt = reg.scalar(b32)
+                        ptx.inst.vote.sync.ballot.b32(blt, needs, 0xFFFFFFFF)
+                        all_skip = reg.scalar(pred)
+                        ptx.inst.setp.eq.b32(all_skip, blt, 0)
+                        ptx.mbarrier.arrive(base + BAR_O_RESC + 8 * stage, pred=all_skip)
+
+                m_scaled = reg.scalar(f32)
+                ptx.inst.mul.f32(m_scaled, m_run[stage], qk_scale_reg)
+                ptx.inst.neg.f32(m_scaled, m_scaled)
+
+                if emu_pairs:
+                    m2 = reg.scalar(b64)
+                    ptx.inst.mov.b64(m2, [m_scaled, m_scaled])
+
+                def exp_pair_emu(i):
+                    # exp2 via degree-3 poly on the packed f32x2 pipe
+                    a0 = reg.scalar(f32); a1 = reg.scalar(f32)
+                    ptx.inst.max.ftz.f32(a0, vals[i], clamp_f)
+                    ptx.inst.max.ftz.f32(a1, vals[i + 1], clamp_f)
+                    l1 = reg.scalar(b64)
+                    ptx.inst.mov.b64(l1, [a0, a1])
+                    ptx.inst.fma.rn.ftz.f32x2(l1, l1, qk2, m2)
+                    l7 = reg.scalar(b64); l8 = reg.scalar(b64); l9 = reg.scalar(b64)
+                    ptx.inst.add.rm.ftz.f32x2(l7, l1, big2)
+                    ptx.inst.sub.rn.ftz.f32x2(l8, l7, big2)
+                    ptx.inst.sub.rn.ftz.f32x2(l9, l1, l8)
+                    l10 = reg.scalar(b64)
+                    ptx.inst.fma.rn.ftz.f32x2(l10, l9, c3_2, c2_2)
+                    ptx.inst.fma.rn.ftz.f32x2(l10, l10, l9, c1_2)
+                    ptx.inst.fma.rn.ftz.f32x2(l10, l10, l9, c0_2)
+                    r1 = reg.scalar(b32); r2 = reg.scalar(b32)
+                    r3 = reg.scalar(b32); r4 = reg.scalar(b32)
+                    ptx.inst.mov.b64([r1, r2], l7)
+                    ptx.inst.mov.b64([r3, r4], l10)
+                    ptx.inst.shl.b32(r1, r1, 23)
+                    ptx.inst.add.s32(r1, r1, r3)
+                    ptx.inst.shl.b32(r2, r2, 23)
+                    ptx.inst.add.s32(r2, r2, r4)
+                    ptx.inst.mov.b32(vals[i], r1)
+                    ptx.inst.mov.b32(vals[i + 1], r2)
+
+                # exp + pack + store P in two 32-element chunks; each chunk
+                # is one quarter of P. A produces quarters 0,1; B: 2,3.
+                for chunk in range(2):
+                    off = chunk * 32
+                    for pair in range(16):
+                        i = off + 2 * pair
+                        if pair in emu_pairs:
+                            exp_pair_emu(i)
+                            continue
+                        ptx.inst.fma.rn.f32(vals[i], vals[i], qk_scale_reg, m_scaled)
+                        ptx.inst.ex2.approx.ftz.f32(vals[i], vals[i])
+                        ptx.inst.fma.rn.f32(vals[i + 1], vals[i + 1], qk_scale_reg, m_scaled)
+                        ptx.inst.ex2.approx.ftz.f32(vals[i + 1], vals[i + 1])
+                    for c in range(16):
+                        ptx.inst.cvt.rn.bf16x2.f32(
+                            packed[c], vals[off + 2 * c + 1], vals[off + 2 * c]
+                        )
+                    if chunk == 0:
+                        ptx.tcgen05.st(p_addr[stage], packed, shape="32x32b", count=16, dtype="b32")
+                    else:
+                        pa = reg.scalar(b32)
+                        ptx.inst.add.u32(pa, p_addr[stage], 16)
+                        ptx.tcgen05.st(pa, packed, shape="32x32b", count=16, dtype="b32")
+                # one arrive per half: A -> quarter barrier 0, B -> 2
+                ptx.tcgen05.wait_st()
+                ptx.tcgen05.fence_before_thread_sync()
+                qbar = reg.scalar(u32)
+                ptx.inst.shr.u32(qbar, col_base, 2)  # 0 (A) or 16 (B)
+                ptx.inst.add.u32(qbar, qbar, base + BAR_P_Q + 32 * stage)
+                ptx.mbarrier.arrive(qbar)
+
+                # row-sum update (overlaps P@V)
+                sums = reg.scalar(f32)
+                acc = [reg.scalar(f32) for _ in range(4)]
+                for a in range(4):
+                    ptx.inst.add.f32(acc[a], vals[a], vals[4 + a])
+                for i in range(8, 64, 4):
+                    for a in range(4):
+                        ptx.inst.add.f32(acc[a], acc[a], vals[i + a])
+                ptx.inst.add.f32(acc[0], acc[0], acc[1])
+                ptx.inst.add.f32(acc[2], acc[2], acc[3])
+                ptx.inst.add.f32(sums, acc[0], acc[2])
+                if is_first:
+                    ptx.inst.mov.f32(l_run[stage], sums)
+                else:
+                    ptx.inst.fma.rn.f32(l_run[stage], l_run[stage], alpha, sums)
+
+            for stage in range(Q_STAGE):
+                body(stage, is_first=True)
+            it = reg.scalar(u32, init=1)
+            go = reg.scalar(pred)
+            ptx.inst.setp.lt.u32(go, it, n_tiles)
+            with ptx.loop("softmax_loop", pred=go):
+                for stage in range(Q_STAGE):
+                    body(stage, is_first=False)
+                it += 1
+                ptx.inst.setp.lt.u32(go, it, n_tiles)
+
+            # publish row sums: both halves write, pair-sync, then A arrives
+            # the stats barrier so correction sees both halves' sums.
+            for s in range(Q_STAGE):
+                ptx.inst.st.shared.b32(ptx.addr(sum_addr[s]), l_run[s])
+            ptx.bar.sync(pair_bar, 64)
+            with ptx.if_(is_a):
+                for s in range(Q_STAGE):
+                    sb = reg.scalar(u32)
+                    ptx.inst.add.u32(sb, stats_bar0, s * 4)
+                    ptx.inst.bar.arrive(sb, 64)
+
+        # =================================================================
+        # Correction warps (tids 256-383): O rescale + epilogue
+        # =================================================================
+        with ptx.if_(is_correction):
+            ptx.setmaxnreg(NREG_CORR, inc=False)
+            one_f = reg.scalar(f32, init=1.0)
+            stats_bar = [reg.scalar(u32) for _ in range(Q_STAGE)]
+            alpha_addr = [reg.scalar(u32) for _ in range(Q_STAGE)]
+            o_addr = [reg.scalar(b32) for _ in range(Q_STAGE)]
+            for s in range(Q_STAGE):
+                ptx.inst.add.u32(stats_bar[s], warp_in_group, 1 + s * 4)
+                ptx.inst.shl.b32(alpha_addr[s], row128, 2)
+                ptx.inst.add.u32(alpha_addr[s], alpha_addr[s], base + SMEM_STATS + s * 512)
+                ptx.inst.mov.b32(o_addr[s], tmem)
+                ptx.inst.add.u32(o_addr[s], o_addr[s], TM_O[s])
+                ptx.inst.add.u32(o_addr[s], o_addr[s], lane_addr_bits)
+
+            # first KV tile needs no correction: release both stages once;
+            # also pre-arrive STATS_FREE so the softmax's pre-write wait at
+            # tile 1 is already satisfied
+            for s in range(Q_STAGE):
+                ptx.mbarrier.arrive(base + BAR_O_RESC + 8 * s)
+                ptx.mbarrier.arrive(base + BAR_STATS_FREE + 8 * s)
+
+            ovals = reg.array(f32, 64)
+
+            if n_tiles > 1:
+                it = reg.scalar(u32, init=1)
+                go = reg.scalar(pred)
+                ptx.inst.setp.lt.u32(go, it, n_tiles)
+                with ptx.loop("corr_loop", pred=go):
+                    for stage in range(Q_STAGE):
+                        ptx.bar.sync(stats_bar[stage], 64)
+                        alpha = reg.scalar(f32)
+                        av = smem.load(b32, ptx.addr(alpha_addr[stage]))
+                        ptx.inst.mov.b32(alpha, av)
+                        ptx.mbarrier.arrive(base + BAR_STATS_FREE + 8 * stage)
+                        need = reg.scalar(pred)
+                        ptx.inst.setp.lt.f32(need, alpha, one_f)
+                        ballot = reg.scalar(b32)
+                        ptx.inst.vote.sync.ballot.b32(ballot, need, 0xFFFFFFFF)
+                        any_need = reg.scalar(pred)
+                        ptx.inst.setp.ne.b32(any_need, ballot, 0)
+                        # softmax already released O_RESC when nothing rescales
+                        with ptx.if_(any_need):
+                            ptx.tcgen05.fence_after_thread_sync()
+                            for half in range(2):
+                                addr = reg.scalar(b32)
+                                ptx.inst.add.u32(addr, o_addr[stage], half * 64)
+                                ptx.tcgen05.ld(ovals, addr, shape="32x32b", count=64, dtype="b32")
+                                ptx.tcgen05.wait_ld()
+                                for i in range(64):
+                                    ptx.inst.mul.f32(ovals[i], ovals[i], alpha)
+                                ptx.tcgen05.st(addr, ovals, shape="32x32b", count=64, dtype="b32")
+                            ptx.tcgen05.wait_st()
+                            ptx.tcgen05.fence_before_thread_sync()
+                            ptx.mbarrier.arrive(base + BAR_O_RESC + 8 * stage)
+                    it += 1
+                    ptx.inst.setp.lt.u32(go, it, n_tiles)
+
+            # ---- epilogue: wait all PV done, normalize, store bf16 ----
+            done_phase = reg.scalar(b32, init=0)
+            ptx.mbarrier.wait(base + BAR_O_DONE, done_phase)
+            ptx.tcgen05.fence_after_thread_sync()
+
+            (po,) = ptx.global_ptrs(O)
+            out_row = reg.scalar(u32)
+            ptx.inst.add.u32(out_row, q_row0, row128)
+
+            opacked = reg.array(b32, 16)
+            for stage in range(Q_STAGE):
+                ptx.bar.sync(stats_bar[stage], 64)
+                la = smem.load(b32, ptx.addr(alpha_addr[stage] + 1024))
+                lb = smem.load(b32, ptx.addr(alpha_addr[stage] + 2048))
+                l = reg.scalar(f32)
+                laf = reg.scalar(f32); lbf = reg.scalar(f32)
+                ptx.inst.mov.b32(laf, la)
+                ptx.inst.mov.b32(lbf, lb)
+                ptx.inst.add.f32(l, laf, lbf)
+                inv_l = reg.scalar(f32)
+                ptx.inst.rcp.approx.f32(inv_l, l)
+
+                row = reg.scalar(u32)
+                ptx.inst.add.u32(row, out_row, stage * BM)
+                byte_off = reg.scalar(u64)
+                ptx.inst.mul.wide.u32(byte_off, row, HD * 2)
+                gptr = po + byte_off
+
+                for quarter in range(4):
+                    addr = reg.scalar(b32)
+                    ptx.inst.add.u32(addr, o_addr[stage], quarter * 32)
+                    part = [ovals[i] for i in range(32)]
+                    ptx.tcgen05.ld(part, addr, shape="32x32b", count=32, dtype="b32")
+                    ptx.tcgen05.wait_ld()
+                    for i in range(32):
+                        ptx.inst.mul.f32(ovals[i], ovals[i], inv_l)
+                    for c in range(16):
+                        ptx.inst.cvt.rn.bf16x2.f32(
+                            opacked[c], ovals[2 * c + 1], ovals[2 * c]
+                        )
+                    for vec in range(4):
+                        ptx.inst.st.global_.v4.b32(
+                            ptx.addr(gptr, quarter * 64 + vec * 16),
+                            [opacked[vec * 4 + k] for k in range(4)],
+                        )
+
+        ptx.bar.sync(0, 512)
+        with ptx.if_(alloc_warp):
+            ptx.tcgen05.dealloc(tmem, 512)
+            ptx.tcgen05.relinquish_alloc_permit()
+        ptx.ret()
+
+    return flash_attn_fwd
+
+
+
+
+# =====================================================================
+# 2-CTA (cta_group::2) variant — FA4's shipping configuration for
+# non-causal head_dim=128. A cluster of 2 CTAs covers 512 query rows;
+# each K/V tile is split across the pair (K by KV rows, V by head-dim
+# columns), halving per-CTA SMEM traffic. The lead CTA's MMA warp
+# drives 256-row tcgen05.mma instructions for the whole pair.
+# =====================================================================
+
+KV_HALF_BYTES = TILE_BYTES // 2      # 16 KB: one CTA's half of a K/V tile
+SLOT_UNITS_2 = KV_HALF_BYTES // 16   # ring-slot stride in descriptor units
+
+SMEM2_Q = 0
+SMEM2_KV = SMEM2_Q + Q_BYTES                     # 65536
+SMEM2_STATS = SMEM2_KV + KV_SLOTS * KV_HALF_BYTES  # 131072
+#   alpha[2][128] @ +0, sum[2][128] @ +1024
+SMEM2_BARS = SMEM2_STATS + 2048
+B2_Q = SMEM2_BARS + 0             # 8   (lead-tracked, both CTAs' Q)
+B2_KV_FULL = SMEM2_BARS + 8       # 4 x 8 (lead-tracked)
+B2_KV_FREE = SMEM2_BARS + 40      # 4 x 8 (local, multicast commit)
+B2_S_FULL = SMEM2_BARS + 72       # 2 x 8 (local, multicast commit)
+B2_P_FULL = SMEM2_BARS + 88       # 2 x 8 (lead, count 256)
+B2_O_RESC = SMEM2_BARS + 104      # 2 x 8 (lead, count 256)
+B2_O_DONE = SMEM2_BARS + 120      # 8   (local, multicast commit)
+B2_STATS_FREE = SMEM2_BARS + 128  # 2 x 8 (local)
+B2_STATS_FULL = SMEM2_BARS + 144  # 2 x 8 (beacon mode only)
+SMEM2_TMEM_SLOT = SMEM2_BARS + 160
+SMEM2_BYTES = SMEM2_TMEM_SLOT + 16
+
+
+def _khalf_desc_off(kk: int) -> int:
+    """K-atom offset for a CTA's 64-row K half (two 8 KB stripes)."""
+    return (kk // 4) * 512 + (kk % 4) * 2
+
+
+def build_flash_attention_blackwell_2cta(
+    seqlen: int,
+    batch_heads: int,
+    head_dim: int = 128,
+    *,
+    sm_scale: float | None = None,
+    arch: str = "sm_100a",
+    rescale_threshold: float = RESCALE_THRESHOLD,
+    debug_plumbing: bool = False,
+    debug_blind_feed: bool = False,
+    debug_pv_smem_a: bool = False,
+    debug_paced_sim: bool = False,
+    debug_mma_level: int = 4,
+    debug_beacon: bool = False,
+):
+    assert head_dim == HD, "2-CTA variant supports head_dim=128 only"
+    assert seqlen % 512 == 0, f"seqlen must be a multiple of 512, got {seqlen}"
+    n_tiles = seqlen // BN
+    assert n_tiles % 2 == 0
+    if sm_scale is None:
+        sm_scale = 1.0 / math.sqrt(head_dim)
+    qk_scale = sm_scale * LOG2E
+    total_rows = batch_heads * seqlen
+
+    @kernel(
+        in_specs=(
+            Tile(total_rows, HD, bf16, Layout.TMA_128B, tma_box=(BM, 64)),
+            Tile(total_rows, HD, bf16, Layout.TMA_128B, tma_box=(64, 64)),
+            Tile(total_rows, HD, bf16, Layout.TMA_128B, tma_box=(BN, 64)),
+        ),
+        out_specs=(Tile(total_rows, HD, bf16, Layout.ROW),),
+        grid=(seqlen // (Q_STAGE * BM), batch_heads, 1),
+        cluster=(2, 1, 1),
+        block=(512, 1, 1),
+        arch=arch,
+        smem=SMEM2_BYTES,
+        extern_smem=True,
+        raw_directives=[
+            ("reqntid", (512, 1, 1)),
+            ("explicitcluster", ()),
+            ("reqnctapercluster", (2, 1, 1)),
+        ],
+    )
+    def flash_attn_fwd_2cta(Q, K, V, O):
+        base = smem.base()
+        tid = reg.scalar(u32); ptx.inst.mov.u32(tid, ptx.special.tid.x())
+        m_block = reg.scalar(u32); ptx.inst.mov.u32(m_block, ptx.special.ctaid.x())
+        bh = reg.scalar(u32); ptx.inst.mov.u32(bh, ptx.special.ctaid.y())
+        cta_rank = reg.scalar(u32)
+        ptx.inst.mov.u32(cta_rank, ptx.sreg("%cluster_ctarank"))
+        is_lead = reg.scalar(pred)
+        ptx.inst.setp.eq.u32(is_lead, cta_rank, 0)
+        rank0 = reg.scalar(u32, init=0)
+
+        warp = tid >> 5
+        row128 = reg.scalar(u32); ptx.inst.and_.b32(row128, tid, 127)
+        lane_addr_bits = reg.scalar(u32)
+        ptx.inst.and_.b32(lane_addr_bits, tid, 96)
+        ptx.inst.shl.b32(lane_addr_bits, lane_addr_bits, 16)
+        warp_in_group = reg.scalar(u32)
+        ptx.inst.and_.b32(warp_in_group, warp, 3)
+
+        is_softmax0 = reg.scalar(pred); ptx.inst.setp.lt.u32(is_softmax0, tid, 128)
+        is_softmax1 = reg.scalar(pred)
+        is_correction = reg.scalar(pred)
+        with ptx.scope():
+            ge = reg.scalar(pred); lt = reg.scalar(pred)
+            ptx.inst.setp.ge.u32(ge, tid, 128)
+            ptx.inst.setp.lt.u32(lt, tid, 256)
+            ptx.inst.and_.pred(is_softmax1, ge, lt)
+            ptx.inst.setp.ge.u32(ge, tid, 256)
+            ptx.inst.setp.lt.u32(lt, tid, 384)
+            ptx.inst.and_.pred(is_correction, ge, lt)
+        is_mma = reg.scalar(pred)
+        with ptx.scope():
+            t = reg.scalar(pred)
+            ptx.inst.setp.eq.u32(t, tid, MMA_TID)
+            ptx.inst.and_.pred(is_mma, t, is_lead)
+        is_load = reg.scalar(pred); ptx.inst.setp.eq.u32(is_load, tid, LOAD_TID)
+        alloc_warp = reg.scalar(pred)
+        ptx.inst.setp.eq.u32(alloc_warp, warp, 12)
+        _never = reg.scalar(pred)
+        with ptx.scope():
+            zz = reg.scalar(u32, init=0)
+            ptx.inst.setp.ne.u32(_never, zz, 0)
+
+        # Row bases. A cluster covers 512 query rows: stage s of the pair is
+        # rows [pair_base + s*256, +256), and this CTA owns the rank half.
+        pair_base = reg.scalar(u32)
+        with ptx.scope():
+            cluster_x = reg.scalar(u32)
+            ptx.inst.shr.u32(cluster_x, m_block, 1)
+            ptx.inst.mul.lo.u32(pair_base, cluster_x, 2 * Q_STAGE * BM)
+            bh_rows = reg.scalar(u32)
+            ptx.inst.mul.lo.u32(bh_rows, bh, seqlen)
+            ptx.inst.add.u32(pair_base, pair_base, bh_rows)
+        rank_off = reg.scalar(u32)
+        ptx.inst.mul.lo.u32(rank_off, cta_rank, BM)
+        q_row0 = reg.scalar(u32)          # this CTA's stage-0 Q rows
+        ptx.inst.add.u32(q_row0, pair_base, rank_off)
+        kv_row0 = reg.scalar(u32)
+        ptx.inst.mul.lo.u32(kv_row0, bh, seqlen)
+
+        # ---- init barriers, allocate cluster TMEM ----
+        with ptx.if_(tid == 0):
+            ptx.mbarrier.init(base + B2_Q, 1)
+            for s in range(KV_SLOTS):
+                ptx.mbarrier.init(base + B2_KV_FULL + 8 * s, 1)
+                ptx.mbarrier.init(base + B2_KV_FREE + 8 * s, 1)
+            for i in range(2):
+                ptx.mbarrier.init(base + B2_S_FULL + 8 * i, 1)
+                ptx.mbarrier.init(base + B2_P_FULL + 8 * i, 256)
+                ptx.mbarrier.init(base + B2_O_RESC + 8 * i, 256)
+                ptx.mbarrier.init(base + B2_STATS_FREE + 8 * i, 128)
+                ptx.mbarrier.init(base + B2_STATS_FULL + 8 * i, 128)
+            ptx.mbarrier.init(base + B2_O_DONE, 1)
+            ptx.fence.proxy_async_shared_cta()
+        with ptx.if_(alloc_warp):
+            ptx.tcgen05.alloc(base + SMEM2_TMEM_SLOT, 512, cta_group=2)
+        ptx.cluster.sync()
+        tmem = smem.load(b32, ptx.addr(base + SMEM2_TMEM_SLOT))
+
+        _bw_cnt = [0]
+        beaconed = reg.scalar(pred) if debug_beacon else None
+        if debug_beacon:
+            with ptx.scope():
+                z = reg.scalar(u32, init=0)
+                ptx.inst.setp.ne.u32(beaconed, z, 0)
+
+        def progress(marker: int, itreg=None):
+            if not debug_beacon:
+                return
+            (pob,) = ptx.global_ptrs(O)
+            idx = reg.scalar(u32)
+            ptx.inst.mad.lo.u32(idx, m_block, 512, tid)
+            ptx.inst.add.u32(idx, idx, 1024)
+            off = reg.scalar(u64)
+            ptx.inst.mul.wide.u32(off, idx, 4)
+            val = reg.scalar(b32, init=0xB0B00000 | (marker << 8))
+            if itreg is not None:
+                ptx.inst.or_.b32(val, val, itreg)
+            ptx.inst.st.global_.b32(ptx.addr(pob + off), val)
+
+        def bwait(addr, ph, site: int, extra: int = 0):
+            if not debug_beacon:
+                ptx.mbarrier.wait(addr, ph)
+                return
+            _bw_cnt[0] += 1
+            lbl = f"bw_{site}_{extra}_{_bw_cnt[0]}"
+            tries = reg.scalar(u32, init=0)
+            ptx.label(lbl)
+            pdone = ptx.mbarrier.try_wait(addr, ph)
+            ptx.bra(lbl + "_ok", pred=pdone)
+            ptx.inst.add.u32(tries, tries, 1)
+            keep = reg.scalar(pred)
+            ptx.inst.setp.lt.u32(keep, tries, 3000000)
+            ptx.bra(lbl, pred=keep)
+            # timed out: record first-blame beacon, then pretend success so
+            # the pipeline drains and the kernel exits cleanly
+            ptx.bra(lbl + "_skipw", pred=beaconed)
+            (pob,) = ptx.global_ptrs(O)
+            idx = reg.scalar(u32)
+            ptx.inst.mad.lo.u32(idx, m_block, 512, tid)
+            off = reg.scalar(u64)
+            ptx.inst.mul.wide.u32(off, idx, 4)
+            val = reg.scalar(b32, init=0xBEAC0000 | (site << 8) | extra)
+            ptx.inst.st.global_.b32(ptx.addr(pob + off), val)
+            with ptx.scope():
+                o1 = reg.scalar(u32, init=1)
+                ptx.inst.setp.ne.u32(beaconed, o1, 0)
+            ptx.label(lbl + "_skipw")
+            ptx.label(lbl + "_ok")
+
+        NREG_SOFTMAX = 192
+        NREG_CORR = 72
+        NREG_OTHER = 56
+
+        # =================================================================
+        # TMA load warp: each CTA loads its own Q rows, its 64-KV-row half
+        # of K, and its 64-head-dim-col half of V. Completions land on the
+        # lead CTA's barriers (collective TMA).
+        # =================================================================
+        is_other_wg = reg.scalar(pred)
+        ptx.inst.setp.ge.u32(is_other_wg, tid, 384)
+        with ptx.if_(is_other_wg):
+            ptx.setmaxnreg(NREG_OTHER, inc=False)
+
+        with ptx.if_(is_load):
+            mapped_q = ptx.cluster.map_shared_u32(base + B2_Q, 0)
+
+            def collective_load(dst_off, tensor, coord, mapped_bar):
+                ptx.cp.async_.bulk.tensor_2d.shared_cta_global_tile(
+                    dst=base + dst_off,
+                    src=tensor.tma_desc(),
+                    coord=coord,
+                    mbar=mapped_bar,
+                    cta_group=2,
+                )
+
+            # Q: 2 stages x 2 stripes for this CTA's rows
+            with ptx.if_(is_lead):
+                ptx.mbarrier.arrive_expect_tx(base + B2_Q, 4 * TILE_BYTES)
+            q_row1 = reg.scalar(u32)
+            ptx.inst.add.u32(q_row1, q_row0, 2 * BM)   # stage 1 rows
+            for s, rr in ((0, q_row0), (1, q_row1)):
+                for stripe in range(2):
+                    collective_load(
+                        SMEM2_Q + s * TILE_BYTES + stripe * STRIPE_BYTES,
+                        Q, (stripe * 64, rr), mapped_q,
+                    )
+
+            krow = reg.scalar(u32)
+            ptx.inst.mul.lo.u32(krow, cta_rank, 64)
+            ptx.inst.add.u32(krow, krow, kv_row0)      # +64 rows for rank 1
+            vrow = reg.scalar(u32); ptx.inst.mov.u32(vrow, kv_row0)
+
+            mapped_kv = [
+                ptx.cluster.map_shared_u32(base + B2_KV_FULL + 8 * s, 0)
+                for s in range(KV_SLOTS)
+            ]
+
+            def load_k_half(slot):
+                with ptx.if_(is_lead):
+                    ptx.mbarrier.arrive_expect_tx(base + B2_KV_FULL + 8 * slot, TILE_BYTES)
+                for stripe in range(2):
+                    collective_load(
+                        SMEM2_KV + slot * KV_HALF_BYTES + stripe * (KV_HALF_BYTES // 2),
+                        K, (stripe * 64, krow), mapped_kv[slot],
+                    )
+                ptx.inst.add.u32(krow, krow, BN)
+
+            def load_v_half(slot):
+                # constant inner coordinate per rank (rank 1 takes head-dim
+                # columns 64-127)
+                with ptx.if_(is_lead):
+                    ptx.mbarrier.arrive_expect_tx(base + B2_KV_FULL + 8 * slot, TILE_BYTES)
+                with ptx.if_(is_lead):
+                    collective_load(
+                        SMEM2_KV + slot * KV_HALF_BYTES, V, (0, vrow), mapped_kv[slot],
+                    )
+                with ptx.else_():
+                    collective_load(
+                        SMEM2_KV + slot * KV_HALF_BYTES, V, (64, vrow), mapped_kv[slot],
+                    )
+                ptx.inst.add.u32(vrow, vrow, BN)
+
+            load_k_half(0)
+            load_v_half(1)
+            load_k_half(2)
+            load_v_half(3)
+
+            trips = (n_tiles - 2) // 2
+            if trips > 0:
+                free_phase = [reg.scalar(b32, init=0) for _ in range(KV_SLOTS)]
+                trip = reg.scalar(u32, init=0)
+                go = reg.scalar(pred)
+                ptx.inst.setp.lt.u32(go, trip, trips)
+                with ptx.loop("kv2_load_loop", pred=go):
+                    for slot, fn in ((0, load_k_half), (1, load_v_half),
+                                     (2, load_k_half), (3, load_v_half)):
+                        bwait(base + B2_KV_FREE + 8 * slot, free_phase[slot], 8, slot)
+                        free_phase[slot] ^= 1
+                        # cluster-scope proxy acquire before reusing a
+                        # collective TMA slot (Mosaic/CUTLASS pattern)
+                        ptx.fence.proxy_async_generic_acquire_shared_cluster()
+                        fn(slot)
+                    trip += 1
+                    ptx.inst.setp.lt.u32(go, trip, trips)
+
+        # =================================================================
+        # MMA dispatch warp — lead CTA only. m=256 instructions span the
+        # pair; descriptors address each CTA's local SMEM symmetrically.
+        # =================================================================
+        with ptx.if_(is_mma):
+            idesc_qk = reg.scalar(
+                b32,
+                init=ptx.tcgen05.make_instr_desc_f16bf16_f32(
+                    m=256, n=BN, ab_dtype="bf16", a_major="K", b_major="K"
+                ),
+            )
+            idesc_pv = reg.scalar(
+                b32,
+                init=ptx.tcgen05.make_instr_desc_f16bf16_f32(
+                    m=256, n=HD, ab_dtype="bf16", a_major="K", b_major="MN"
+                ),
+            )
+            p_acc = reg.scalar(pred)
+            p_noacc = reg.scalar(pred)
+            with ptx.scope():
+                one = reg.scalar(u32, init=1)
+                zero = reg.scalar(u32, init=0)
+                ptx.inst.setp.ne.b32(p_acc, one, 0)
+                ptx.inst.setp.ne.b32(p_noacc, zero, 0)
+            from pyptx.types import b16
+            mcast = reg.scalar(b16)
+            ptx.inst.mov.b16(mcast, 3)
+
+            dq0 = ptx.tcgen05.masked_descriptor(base + SMEM2_Q)
+            dk0 = ptx.tcgen05.masked_descriptor(base + SMEM2_KV)
+            dv0 = ptx.tcgen05.descriptor(
+                base + SMEM2_KV + KV_HALF_BYTES,
+                stride_bytes=1024, leading_bytes=16384, swizzle="128B",
+            )
+
+            def qk_mma(stage: int, k_idx: int):
+                d = tmem + TM_S[stage]
+                for kk in range(8):
+                    if debug_mma_level < 1:
+                        break
+                    off_a = stage * SLOT_UNITS + _kmajor_desc_off(kk)
+                    off_b = k_idx * 2 * SLOT_UNITS_2 + _khalf_desc_off(kk)
+                    da = dq0 if off_a == 0 else reg.scalar(b64)
+                    if off_a:
+                        ptx.inst.add.s64(da, dq0, off_a)
+                    db = dk0 if off_b == 0 else reg.scalar(b64)
+                    if off_b:
+                        ptx.inst.add.s64(db, dk0, off_b)
+                    ptx.tcgen05.mma(
+                        d, da, db, idesc_qk, kind="f16", cta_group=2,
+                        pred_operand=(p_noacc if kk == 0 else p_acc),
+                    )
+                ptx.tcgen05.commit(
+                    base + B2_S_FULL + 8 * stage, cta_group=2,
+                    multicast=True, multicast_mask=mcast, space="cluster",
+                )
+
+            ph_kv = [reg.scalar(b32, init=0) for _ in range(KV_SLOTS)]
+            ph_p = [reg.scalar(b32, init=0) for _ in range(Q_STAGE)]
+            ph_or = [reg.scalar(b32, init=0) for _ in range(Q_STAGE)]
+
+            def wait_kv(slot: int):
+                bwait(base + B2_KV_FULL + 8 * slot, ph_kv[slot], 2, slot)
+                ph_kv[slot] ^= 1
+
+            def commit_free(slot: int):
+                ptx.tcgen05.commit(
+                    base + B2_KV_FREE + 8 * slot, cta_group=2,
+                    multicast=True, multicast_mask=mcast, space="cluster",
+                )
+
+            def pv_mma(stage: int, v_idx: int, first_accum: bool):
+                d = tmem + TM_O[stage]
+                bwait(base + B2_P_FULL + 8 * stage, ph_p[stage], 3, stage)
+                ph_p[stage] ^= 1
+                bwait(base + B2_O_RESC + 8 * stage, ph_or[stage], 4, stage)
+                ph_or[stage] ^= 1
+                ptx.tcgen05.fence_after_thread_sync()
+                for kk in range(8):
+                    if debug_mma_level < 2:
+                        break
+                    a = tmem + (TM_P[stage] + kk * 8)
+                    off_b = v_idx * 2 * SLOT_UNITS_2 + kk * 128
+                    db = dv0 if off_b == 0 else reg.scalar(b64)
+                    if off_b:
+                        ptx.inst.add.s64(db, dv0, off_b)
+                    if debug_mma_level == 2:
+                        # PV with all-K-major operands (dq0/dk0, QK idesc)
+                        ptx.tcgen05.mma(
+                            d, dq0, dk0, idesc_qk, kind="f16", cta_group=2,
+                            pred_operand=(p_noacc if (first_accum and kk == 0) else p_acc),
+                        )
+                    elif debug_mma_level == 3:
+                        # PV with SMEM A + real MN-major V descriptor
+                        ptx.tcgen05.mma(
+                            d, dq0, db, idesc_pv, kind="f16", cta_group=2,
+                            pred_operand=(p_noacc if (first_accum and kk == 0) else p_acc),
+                        )
+                    elif debug_pv_smem_a:
+                        ptx.tcgen05.mma(
+                            d, dq0, db, idesc_pv, kind="f16", cta_group=2,
+                            pred_operand=(p_noacc if (first_accum and kk == 0) else p_acc),
+                        )
+                    else:
+                        ptx.tcgen05.mma(
+                            d, a, db, idesc_pv, kind="f16", cta_group=2,
+                            a_is_tmem=True,
+                            pred_operand=(p_noacc if (first_accum and kk == 0) else p_acc),
+                        )
+
+            # ---- prologue ----
+            ph_q = reg.scalar(b32, init=0)
+            bwait(base + B2_Q, ph_q, 1)
+            wait_kv(0)
+            qk_mma(0, 0)
+            qk_mma(1, 0)
+            commit_free(0)
+
+            wait_kv(1)
+            pv_mma(0, 0, first_accum=True)
+            wait_kv(2)
+            qk_mma(0, 1)
+            pv_mma(1, 0, first_accum=True)
+            qk_mma(1, 1)
+            commit_free(2)
+            commit_free(1)
+
+            trips = (n_tiles - 2) // 2
+            if trips > 0:
+                trip = reg.scalar(u32, init=0)
+                go = reg.scalar(pred)
+                ptx.inst.setp.lt.u32(go, trip, trips)
+                with ptx.loop("mma2_loop", pred=go):
+                    wait_kv(3)
+                    for stage in range(Q_STAGE):
+                        pv_mma(stage, 1, first_accum=False)
+                        if stage == 0:
+                            wait_kv(0)
+                        qk_mma(stage, 0)
+                    commit_free(0)
+                    commit_free(3)
+                    wait_kv(1)
+                    for stage in range(Q_STAGE):
+                        pv_mma(stage, 0, first_accum=False)
+                        if stage == 0:
+                            wait_kv(2)
+                        qk_mma(stage, 1)
+                    commit_free(2)
+                    commit_free(1)
+                    trip += 1
+                    ptx.inst.setp.lt.u32(go, trip, trips)
+
+            wait_kv(3)
+            for stage in range(Q_STAGE):
+                pv_mma(stage, 1, first_accum=False)
+            ptx.tcgen05.commit(
+                base + B2_O_DONE, cta_group=2,
+                multicast=True, multicast_mask=mcast, space="cluster",
+            )
+
+        # =================================================================
+        # Softmax groups (per CTA): stage 0 = tids 0-127, stage 1 = 128-255.
+        # Single pass, thread-local full row. P_FULL arrives go to the lead
+        # CTA's barrier (count 256 across the pair).
+        # =================================================================
+        def softmax_group(stage: int):
+            s_lo = reg.scalar(b32)
+            ptx.inst.mov.b32(s_lo, tmem)
+            ptx.inst.add.u32(s_lo, s_lo, TM_S[stage])
+            ptx.inst.add.u32(s_lo, s_lo, lane_addr_bits)
+            s_hi = reg.scalar(b32)
+            ptx.inst.add.u32(s_hi, s_lo, 64)
+            p_lo = reg.scalar(b32)
+            ptx.inst.mov.b32(p_lo, tmem)
+            ptx.inst.add.u32(p_lo, p_lo, TM_P[stage])
+            ptx.inst.add.u32(p_lo, p_lo, lane_addr_bits)
+
+            p_full_addr = reg.scalar(u32, init=0)
+            ptx.inst.add.u32(p_full_addr, p_full_addr, base + B2_P_FULL + 8 * stage)
+
+            qk_scale_reg = reg.scalar(f32, init=qk_scale)
+            neg_thresh = reg.scalar(f32, init=-rescale_threshold)
+            one_f = reg.scalar(f32, init=1.0)
+            m_run = reg.scalar(f32, init=-1e30)
+            l_run = reg.scalar(f32, init=0.0)
+
+            alpha_addr = reg.scalar(u32)
+            ptx.inst.shl.b32(alpha_addr, row128, 2)
+            ptx.inst.add.u32(alpha_addr, alpha_addr, base + SMEM2_STATS + stage * 512)
+            sum_addr = reg.scalar(u32)
+            ptx.inst.add.u32(sum_addr, alpha_addr, 1024)
+
+            stats_bar = reg.scalar(u32)
+            ptx.inst.add.u32(stats_bar, warp_in_group, 1 + stage * 4)
+
+            ph_s = reg.scalar(b32, init=0)
+            ph_stats = reg.scalar(b32, init=0)
+            tcount = reg.scalar(u32, init=0)
+
+            vals_lo = reg.array(f32, 64)
+            vals_hi = reg.array(f32, 64)
+            packed = reg.array(b32, 16)
+
+            def tile_max(dst, vals):
+                acc = [reg.scalar(f32) for _ in range(4)]
+                for a in range(4):
+                    ptx.inst.max.f32(acc[a], vals[a], vals[4 + a], vals[8 + a])
+                for i in range(12, 60, 8):
+                    for a in range(4):
+                        ptx.inst.max.f32(acc[a], acc[a], vals[i + a], vals[i + 4 + a])
+                for a in range(4):
+                    ptx.inst.max.f32(acc[a], acc[a], vals[60 + a])
+                ptx.inst.max.f32(acc[0], acc[0], acc[1], acc[2])
+                ptx.inst.max.f32(dst, acc[0], acc[3])
+
+            def exp_pack_store(vals, m_scaled, p_base_addr, word_off):
+                for chunk in range(2):
+                    off = chunk * 32
+                    for i in range(off, off + 32):
+                        ptx.inst.fma.rn.f32(vals[i], vals[i], qk_scale_reg, m_scaled)
+                        ptx.inst.ex2.approx.ftz.f32(vals[i], vals[i])
+                    for c in range(16):
+                        ptx.inst.cvt.rn.bf16x2.f32(
+                            packed[c], vals[off + 2 * c + 1], vals[off + 2 * c]
+                        )
+                    pa = reg.scalar(b32)
+                    ptx.inst.add.u32(pa, p_base_addr, word_off + chunk * 16)
+                    ptx.tcgen05.st(pa, packed, shape="32x32b", count=16, dtype="b32")
+
+            def sum_half(vals, sum_dst):
+                acc = [reg.scalar(f32) for _ in range(4)]
+                for a in range(4):
+                    ptx.inst.add.f32(acc[a], vals[a], vals[4 + a])
+                for i in range(8, 64, 4):
+                    for a in range(4):
+                        ptx.inst.add.f32(acc[a], acc[a], vals[i + a])
+                ptx.inst.add.f32(acc[0], acc[0], acc[1])
+                ptx.inst.add.f32(acc[2], acc[2], acc[3])
+                ptx.inst.add.f32(sum_dst, acc[0], acc[2])
+
+            def body(is_first: bool):
+                bwait(base + B2_S_FULL + 8 * stage, ph_s, 5, stage)
+                ptx.inst.xor.b32(ph_s, ph_s, 1)
+                ptx.tcgen05.fence_after_thread_sync()
+
+                ptx.tcgen05.ld(vals_lo, s_lo, shape="32x32b", count=64, dtype="b32")
+                ptx.tcgen05.ld(vals_hi, s_hi, shape="32x32b", count=64, dtype="b32")
+                ptx.tcgen05.wait_ld()
+                progress(1 + stage, tcount)
+                max_a = reg.scalar(f32)
+                tile_max(max_a, vals_lo)
+                max_b = reg.scalar(f32)
+                tile_max(max_b, vals_hi)
+                ptx.inst.max.f32(max_b, max_b, max_a)
+
+                alpha = reg.scalar(f32)
+                if not is_first:
+                    m_new = reg.scalar(f32)
+                    ptx.inst.max.f32(m_new, m_run, max_b)
+                    d = reg.scalar(f32)
+                    ptx.inst.sub.f32(d, m_run, m_new)
+                    ptx.inst.mul.f32(d, d, qk_scale_reg)
+                    keep = reg.scalar(pred)
+                    ptx.inst.setp.ge.f32(keep, d, neg_thresh)
+                    with ptx.if_(keep):
+                        ptx.inst.mov.f32(alpha, one_f)
+                    with ptx.else_():
+                        ptx.inst.ex2.approx.ftz.f32(alpha, d)
+                        ptx.inst.mov.f32(m_run, m_new)
+                    bwait(base + B2_STATS_FREE + 8 * stage, ph_stats, 6, stage)
+                    ptx.inst.xor.b32(ph_stats, ph_stats, 1)
+                    ptx.inst.st.shared.b32(ptx.addr(alpha_addr), alpha)
+                    ptx.mbarrier.arrive(base + B2_STATS_FULL + 8 * stage)
+                else:
+                    ptx.inst.mov.f32(m_run, max_b)
+
+                m_scaled = reg.scalar(f32)
+                ptx.inst.mul.f32(m_scaled, m_run, qk_scale_reg)
+                ptx.inst.neg.f32(m_scaled, m_scaled)
+
+                exp_pack_store(vals_lo, m_scaled, p_lo, 0)
+                exp_pack_store(vals_hi, m_scaled, p_lo, 32)
+                ptx.tcgen05.wait_st()
+                progress(3 + stage, tcount)
+                if debug_beacon:
+                    ptx.inst.add.u32(tcount, tcount, 1)
+                ptx.tcgen05.fence_before_thread_sync()
+                progress(8, tcount)
+                ptx.cluster.arrive_remote(p_full_addr, rank0)
+                progress(9, tcount)
+
+                sum_a = reg.scalar(f32)
+                sum_b = reg.scalar(f32)
+                sum_half(vals_lo, sum_a)
+                sum_half(vals_hi, sum_b)
+                ptx.inst.add.f32(sum_a, sum_a, sum_b)
+                if is_first:
+                    ptx.inst.mov.f32(l_run, sum_a)
+                else:
+                    ptx.inst.fma.rn.f32(l_run, l_run, alpha, sum_a)
+                progress(10, tcount)
+
+            body(is_first=True)
+            it = reg.scalar(u32, init=1)
+            go = reg.scalar(pred)
+            ptx.inst.setp.lt.u32(go, it, n_tiles)
+            with ptx.loop(f"softmax2_loop_{stage}", pred=go):
+                body(is_first=False)
+                it += 1
+                ptx.inst.setp.lt.u32(go, it, n_tiles)
+
+            progress(6)
+            ptx.inst.st.shared.b32(ptx.addr(sum_addr), l_run)
+            ptx.mbarrier.arrive(base + B2_STATS_FULL + 8 * stage)
+            progress(7)
+
+        def plumbing_softmax(stage: int):
+            pf = reg.scalar(u32, init=0)
+            ptx.inst.add.u32(pf, pf, base + B2_P_FULL + 8 * stage)
+            ph_s = reg.scalar(b32, init=0)
+            it = reg.scalar(u32, init=0)
+            go = reg.scalar(pred)
+            ptx.inst.setp.lt.u32(go, it, n_tiles)
+            with ptx.loop(f"plumb_sm_{stage}", pred=go):
+                if not debug_blind_feed:
+                    ptx.mbarrier.wait(base + B2_S_FULL + 8 * stage, ph_s)
+                    ptx.inst.xor.b32(ph_s, ph_s, 1)
+                ptx.cluster.arrive_remote(pf, rank0)
+                it += 1
+                ptx.inst.setp.lt.u32(go, it, n_tiles)
+
+        def paced_sim_softmax(stage: int):
+            # real pacing: wait local S_FULL then remote-arrive P_FULL
+            pf = reg.scalar(u32, init=0)
+            ptx.inst.add.u32(pf, pf, base + B2_P_FULL + 8 * stage)
+            ph_s = reg.scalar(b32, init=0)
+            it = reg.scalar(u32, init=0)
+            go = reg.scalar(pred)
+            ptx.inst.setp.lt.u32(go, it, n_tiles)
+            with ptx.loop(f"paced_sm_{stage}", pred=go):
+                ptx.mbarrier.wait(base + B2_S_FULL + 8 * stage, ph_s)
+                ptx.inst.xor.b32(ph_s, ph_s, 1)
+                ptx.cluster.arrive_remote(pf, rank0)
+                it += 1
+                ptx.inst.setp.lt.u32(go, it, n_tiles)
+
+        def paced_sim_correction():
+            orc = [reg.scalar(u32, init=0) for _ in range(Q_STAGE)]
+            ph_s = [reg.scalar(b32, init=0) for _ in range(Q_STAGE)]
+            for s in range(Q_STAGE):
+                ptx.inst.add.u32(orc[s], orc[s], base + B2_O_RESC + 8 * s)
+                ptx.cluster.arrive_remote(orc[s], rank0)
+            it = reg.scalar(u32, init=0)
+            go = reg.scalar(pred)
+            ptx.inst.setp.lt.u32(go, it, n_tiles)
+            with ptx.loop("paced_corr", pred=go):
+                for s in range(Q_STAGE):
+                    ptx.mbarrier.wait(base + B2_S_FULL + 8 * s, ph_s[s])
+                    ptx.inst.xor.b32(ph_s[s], ph_s[s], 1)
+                    ptx.cluster.arrive_remote(orc[s], rank0)
+                it += 1
+                ptx.inst.setp.lt.u32(go, it, n_tiles)
+            dph = reg.scalar(b32, init=0)
+            ptx.mbarrier.wait(base + B2_O_DONE, dph)
+
+        if debug_paced_sim:
+            with ptx.if_(is_softmax0):
+                ptx.setmaxnreg(NREG_SOFTMAX, inc=True)
+                paced_sim_softmax(0)
+            with ptx.if_(is_softmax1):
+                ptx.setmaxnreg(NREG_SOFTMAX, inc=True)
+                paced_sim_softmax(1)
+            with ptx.if_(is_correction):
+                ptx.setmaxnreg(NREG_CORR, inc=False)
+                paced_sim_correction()
+        elif debug_plumbing:
+            with ptx.if_(is_softmax0):
+                ptx.setmaxnreg(NREG_SOFTMAX, inc=True)
+                plumbing_softmax(0)
+            with ptx.if_(is_softmax1):
+                ptx.setmaxnreg(NREG_SOFTMAX, inc=True)
+                plumbing_softmax(1)
+        else:
+            with ptx.if_(is_softmax0):
+                ptx.setmaxnreg(NREG_SOFTMAX, inc=True)
+                softmax_group(0)
+            with ptx.if_(is_softmax1):
+                ptx.setmaxnreg(NREG_SOFTMAX, inc=True)
+                softmax_group(1)
+
+        # =================================================================
+        # Correction warps: O rescale + epilogue (per CTA, O_RESC arrives
+        # go to the lead CTA's barrier)
+        # =================================================================
+        def plumbing_correction():
+            ptx.setmaxnreg(NREG_CORR, inc=False)
+            oresc = [reg.scalar(u32, init=0) for _ in range(Q_STAGE)]
+            for s in range(Q_STAGE):
+                ptx.inst.add.u32(oresc[s], oresc[s], base + B2_O_RESC + 8 * s)
+            it = reg.scalar(u32, init=0)
+            go = reg.scalar(pred)
+            ptx.inst.setp.lt.u32(go, it, n_tiles)
+            with ptx.loop("plumb_corr", pred=go):
+                for s in range(Q_STAGE):
+                    ptx.cluster.arrive_remote(oresc[s], rank0)
+                it += 1
+                ptx.inst.setp.lt.u32(go, it, n_tiles)
+            dphase = reg.scalar(b32, init=0)
+            ptx.mbarrier.wait(base + B2_O_DONE, dphase)
+
+        if debug_plumbing and not debug_paced_sim:
+            with ptx.if_(is_correction):
+                plumbing_correction()
+
+        with ptx.if_(is_correction if not (debug_plumbing or debug_paced_sim) else _never):
+            ptx.setmaxnreg(NREG_CORR, inc=False)
+            one_f = reg.scalar(f32, init=1.0)
+            stats_bar = [reg.scalar(u32) for _ in range(Q_STAGE)]
+            alpha_addr = [reg.scalar(u32) for _ in range(Q_STAGE)]
+            o_addr = [reg.scalar(b32) for _ in range(Q_STAGE)]
+            oresc_addr = [reg.scalar(u32, init=0) for _ in range(Q_STAGE)]
+            for s in range(Q_STAGE):
+                ptx.inst.add.u32(stats_bar[s], warp_in_group, 1 + s * 4)
+                ptx.inst.shl.b32(alpha_addr[s], row128, 2)
+                ptx.inst.add.u32(alpha_addr[s], alpha_addr[s], base + SMEM2_STATS + s * 512)
+                ptx.inst.mov.b32(o_addr[s], tmem)
+                ptx.inst.add.u32(o_addr[s], o_addr[s], TM_O[s])
+                ptx.inst.add.u32(o_addr[s], o_addr[s], lane_addr_bits)
+                ptx.inst.add.u32(oresc_addr[s], oresc_addr[s], base + B2_O_RESC + 8 * s)
+
+            for s in range(Q_STAGE):
+                ptx.cluster.arrive_remote(oresc_addr[s], rank0)
+                # pre-arrive so the softmax's pre-write STATS_FREE wait at
+                # tile 1 is already satisfied (protocol is one tile deep)
+                ptx.mbarrier.arrive(base + B2_STATS_FREE + 8 * s)
+
+            ovals = reg.array(f32, 64)
+
+            if n_tiles > 1:
+                it = reg.scalar(u32, init=1)
+                go = reg.scalar(pred)
+                ptx.inst.setp.lt.u32(go, it, n_tiles)
+                ph_sfull = [reg.scalar(b32, init=0) for _ in range(Q_STAGE)]
+                with ptx.loop("corr2_loop", pred=go):
+                    for stage in range(Q_STAGE):
+                        bwait(base + B2_STATS_FULL + 8 * stage, ph_sfull[stage], 9, stage)
+                        ptx.inst.xor.b32(ph_sfull[stage], ph_sfull[stage], 1)
+                        alpha = reg.scalar(f32)
+                        av = smem.load(b32, ptx.addr(alpha_addr[stage]))
+                        ptx.inst.mov.b32(alpha, av)
+                        ptx.mbarrier.arrive(base + B2_STATS_FREE + 8 * stage)
+                        need = reg.scalar(pred)
+                        ptx.inst.setp.lt.f32(need, alpha, one_f)
+                        ballot = reg.scalar(b32)
+                        ptx.inst.vote.sync.ballot.b32(ballot, need, 0xFFFFFFFF)
+                        any_need = reg.scalar(pred)
+                        ptx.inst.setp.ne.b32(any_need, ballot, 0)
+                        with ptx.if_(any_need):
+                            ptx.tcgen05.fence_after_thread_sync()
+                            for half in range(2):
+                                addr = reg.scalar(b32)
+                                ptx.inst.add.u32(addr, o_addr[stage], half * 64)
+                                ptx.tcgen05.ld(ovals, addr, shape="32x32b", count=64, dtype="b32")
+                                ptx.tcgen05.wait_ld()
+                                for i in range(64):
+                                    ptx.inst.mul.f32(ovals[i], ovals[i], alpha)
+                                ptx.tcgen05.st(addr, ovals, shape="32x32b", count=64, dtype="b32")
+                            ptx.tcgen05.wait_st()
+                            ptx.tcgen05.fence_before_thread_sync()
+                        ptx.cluster.arrive_remote(oresc_addr[stage], rank0)
+                    it += 1
+                    ptx.inst.setp.lt.u32(go, it, n_tiles)
+
+            done_phase = reg.scalar(b32, init=0)
+            bwait(base + B2_O_DONE, done_phase, 7)
+            ptx.tcgen05.fence_after_thread_sync()
+
+            (po,) = ptx.global_ptrs(O)
+            out_row = reg.scalar(u32)
+            ptx.inst.add.u32(out_row, q_row0, row128)
+
+            opacked = reg.array(b32, 16)
+            for stage in range(Q_STAGE):
+                # final stats-full completion parity depends on n_tiles
+                bwait(base + B2_STATS_FULL + 8 * stage,
+                      (n_tiles - 1) & 1, 10, stage)
+                l = reg.scalar(f32)
+                lv = smem.load(b32, ptx.addr(alpha_addr[stage] + 1024))
+                ptx.inst.mov.b32(l, lv)
+                inv_l = reg.scalar(f32)
+                ptx.inst.rcp.approx.f32(inv_l, l)
+
+                row = reg.scalar(u32)
+                ptx.inst.add.u32(row, out_row, stage * 2 * BM)
+                byte_off = reg.scalar(u64)
+                ptx.inst.mul.wide.u32(byte_off, row, HD * 2)
+                gptr = po + byte_off
+
+                for quarter in range(4):
+                    addr = reg.scalar(b32)
+                    ptx.inst.add.u32(addr, o_addr[stage], quarter * 32)
+                    part = [ovals[i] for i in range(32)]
+                    ptx.tcgen05.ld(part, addr, shape="32x32b", count=32, dtype="b32")
+                    ptx.tcgen05.wait_ld()
+                    for i in range(32):
+                        ptx.inst.mul.f32(ovals[i], ovals[i], inv_l)
+                    for c in range(16):
+                        ptx.inst.cvt.rn.bf16x2.f32(
+                            opacked[c], ovals[2 * c + 1], ovals[2 * c]
+                        )
+                    if not debug_beacon:
+                        for vec in range(4):
+                            ptx.inst.st.global_.v4.b32(
+                                ptx.addr(gptr, quarter * 64 + vec * 16),
+                                [opacked[vec * 4 + k] for k in range(4)],
+                            )
+
+        ptx.bar.sync(0, 512)
+        ptx.cluster.sync()
+        with ptx.if_(alloc_warp):
+            ptx.tcgen05.dealloc(tmem, 512, cta_group=2)
+            ptx.tcgen05.relinquish_alloc_permit(cta_group=2)
+        ptx.ret()
+
+    return flash_attn_fwd_2cta
+
+
+
+
+# =====================================================================
+# Occupancy-2 variant: two independent 384-thread CTAs per SM, each
+# driving a single 128-row Q tile with 256 TMEM columns. While one
+# CTA's softmax runs, the other CTA's QK/PV keeps the tensor core hot —
+# cross-CTA interleaving hides the softmax latency that caps the
+# single-CTA pipelines.
+# =====================================================================
+
+O2_SMEM_Q = 0                                # 32 KB
+O2_SMEM_H = 32768                            # 4 x 16 KB half-tile slots:
+#   slot 0: K rows 0-63, slot 1: K rows 64-127,
+#   slot 2: V rows 0-63, slot 3: V rows 64-127
+O2_HALF_BYTES = 16384
+O2_SMEM_STATS = 98304                        # alpha[128], sum[128]
+O2_BARS = O2_SMEM_STATS + 1024
+O2B_Q = O2_BARS + 0
+O2B_H_FULL = O2_BARS + 8        # 4 x 8
+O2B_H_FREE = O2_BARS + 40       # 4 x 8
+O2B_S_FULL = O2_BARS + 72
+O2B_P_FULL = O2_BARS + 80       # count 128
+O2B_O_RESC = O2_BARS + 88       # count 128
+O2B_O_DONE = O2_BARS + 96
+O2B_STATS_FREE = O2_BARS + 104  # count 128
+O2B_STATS_FULL = O2_BARS + 112  # count 128
+O2_TMEM_SLOT = O2_BARS + 128
+O2_SMEM_BYTES = O2_TMEM_SLOT + 16
+
+O2_TM_S = 0     # S/P: cols 0-127 (P packed bf16 in cols 0-63)
+O2_TM_O = 128   # O accumulator: cols 128-255
+
+O2_MMA_TID = 256   # warp 8 lane 0
+O2_LOAD_TID = 288  # warp 9 lane 0
+
+
+def build_flash_attention_blackwell_occ2(
+    seqlen: int,
+    batch_heads: int,
+    head_dim: int = 128,
+    *,
+    sm_scale: float | None = None,
+    arch: str = "sm_100a",
+    rescale_threshold: float = RESCALE_THRESHOLD,
+):
+    assert head_dim == HD
+    assert seqlen % BM == 0, f"seqlen must be a multiple of {BM}"
+    n_tiles = seqlen // BN
+    if sm_scale is None:
+        sm_scale = 1.0 / math.sqrt(head_dim)
+    qk_scale = sm_scale * LOG2E
+    total_rows = batch_heads * seqlen
+
+    @kernel(
+        in_specs=(
+            Tile(total_rows, HD, bf16, Layout.TMA_128B, tma_box=(BM, 64)),
+            Tile(total_rows, HD, bf16, Layout.TMA_128B, tma_box=(64, 64)),
+            Tile(total_rows, HD, bf16, Layout.TMA_128B, tma_box=(64, 64)),
+        ),
+        out_specs=(Tile(total_rows, HD, bf16, Layout.ROW),),
+        grid=(seqlen // BM, batch_heads, 1),
+        block=(384, 1, 1),
+        arch=arch,
+        smem=O2_SMEM_BYTES,
+        extern_smem=True,
+        raw_directives=[
+            ("reqntid", (384, 1, 1)),
+            ("maxnreg", (80,)),
+        ],
+    )
+    def flash_attn_fwd_occ2(Q, K, V, O):
+        base = smem.base()
+        tid = reg.scalar(u32); ptx.inst.mov.u32(tid, ptx.special.tid.x())
+        m_block = reg.scalar(u32); ptx.inst.mov.u32(m_block, ptx.special.ctaid.x())
+        bh = reg.scalar(u32); ptx.inst.mov.u32(bh, ptx.special.ctaid.y())
+
+        warp = tid >> 5
+        is_softmax = reg.scalar(pred); ptx.inst.setp.lt.u32(is_softmax, tid, 128)
+        is_correction = reg.scalar(pred)
+        with ptx.scope():
+            ge = reg.scalar(pred); lt = reg.scalar(pred)
+            ptx.inst.setp.ge.u32(ge, tid, 128)
+            ptx.inst.setp.lt.u32(lt, tid, 256)
+            ptx.inst.and_.pred(is_correction, ge, lt)
+        is_mma = reg.scalar(pred); ptx.inst.setp.eq.u32(is_mma, tid, O2_MMA_TID)
+        is_load = reg.scalar(pred); ptx.inst.setp.eq.u32(is_load, tid, O2_LOAD_TID)
+        alloc_warp = reg.scalar(pred)
+        ptx.inst.setp.eq.u32(alloc_warp, warp, 8)
+
+        def make_q_row0():
+            r = reg.scalar(u32)
+            ptx.inst.mul.lo.u32(r, bh, seqlen)
+            with ptx.scope():
+                mb_rows = reg.scalar(u32)
+                ptx.inst.mul.lo.u32(mb_rows, m_block, BM)
+                ptx.inst.add.u32(r, r, mb_rows)
+            return r
+
+        def make_row128():
+            r = reg.scalar(u32)
+            ptx.inst.and_.b32(r, tid, 127)
+            return r
+
+        def make_lane_bits():
+            r = reg.scalar(u32)
+            ptx.inst.and_.b32(r, tid, 96)
+            ptx.inst.shl.b32(r, r, 16)
+            return r
+
+        with ptx.if_(tid == 0):
+            ptx.mbarrier.init(base + O2B_Q, 1)
+            for h in range(4):
+                ptx.mbarrier.init(base + O2B_H_FULL + 8 * h, 1)
+                ptx.mbarrier.init(base + O2B_H_FREE + 8 * h, 1)
+            ptx.mbarrier.init(base + O2B_S_FULL, 1)
+            ptx.mbarrier.init(base + O2B_P_FULL, 128)
+            ptx.mbarrier.init(base + O2B_O_RESC, 128)
+            ptx.mbarrier.init(base + O2B_O_DONE, 1)
+            ptx.mbarrier.init(base + O2B_STATS_FREE, 128)
+            ptx.mbarrier.init(base + O2B_STATS_FULL, 128)
+            ptx.fence.proxy_async_shared_cta()
+        with ptx.if_(alloc_warp):
+            ptx.tcgen05.alloc(base + O2_TMEM_SLOT, 256)
+            # release the SM-wide allocation permit immediately so the
+            # co-resident CTA can allocate its own 256 columns
+            ptx.tcgen05.relinquish_alloc_permit()
+        ptx.bar.sync(0, 384)
+        tmem = smem.load(b32, ptx.addr(base + O2_TMEM_SLOT))
+
+        # =============================================================
+        # TMA load warp
+        # =============================================================
+        with ptx.if_(is_load):
+            def load_tile(dst_off, tensor, row_reg, mbar_off):
+                for stripe in range(2):
+                    ptx.cp.async_.bulk.tensor_2d(
+                        dst=base + dst_off + stripe * STRIPE_BYTES,
+                        src=tensor.tma_desc(),
+                        coord=(stripe * 64, row_reg),
+                        mbar=base + mbar_off,
+                    )
+
+            q_row_ld = make_q_row0()
+            ptx.mbarrier.arrive_expect_tx(base + O2B_Q, TILE_BYTES)
+            load_tile(O2_SMEM_Q, Q, q_row_ld, O2B_Q)
+
+            krow = reg.scalar(u32)
+            ptx.inst.mul.lo.u32(krow, bh, seqlen)
+            vrow = reg.scalar(u32); ptx.inst.mov.u32(vrow, krow)
+
+            def load_half(slot, tensor, row_reg, row_off):
+                # one 64-row x 128-col half: two 8 KB stripe loads
+                ptx.mbarrier.arrive_expect_tx(
+                    base + O2B_H_FULL + 8 * slot, O2_HALF_BYTES
+                )
+                r = reg.scalar(u32)
+                ptx.inst.add.u32(r, row_reg, row_off)
+                for stripe in range(2):
+                    ptx.cp.async_.bulk.tensor_2d(
+                        dst=base + O2_SMEM_H + slot * O2_HALF_BYTES + stripe * 8192,
+                        src=tensor.tma_desc(),
+                        coord=(stripe * 64, r),
+                        mbar=base + O2B_H_FULL + 8 * slot,
+                    )
+
+            def load_tile_halves():
+                load_half(0, K, krow, 0)
+                load_half(1, K, krow, 64)
+                load_half(2, V, vrow, 0)
+                load_half(3, V, vrow, 64)
+                ptx.inst.add.u32(krow, krow, BN)
+                ptx.inst.add.u32(vrow, vrow, BN)
+
+            load_tile_halves()
+            if n_tiles > 1:
+                ph = [reg.scalar(b32, init=0) for _ in range(4)]
+                it = reg.scalar(u32, init=1)
+                go = reg.scalar(pred)
+                ptx.inst.setp.lt.u32(go, it, n_tiles)
+                with ptx.loop("o2_load_loop", pred=go):
+                    for h, (tensor, row_reg, row_off) in enumerate(
+                        ((K, krow, 0), (K, krow, 64), (V, vrow, 0), (V, vrow, 64))
+                    ):
+                        ptx.mbarrier.wait(base + O2B_H_FREE + 8 * h, ph[h])
+                        ptx.inst.xor.b32(ph[h], ph[h], 1)
+                        load_half(h, tensor, row_reg, row_off)
+                    ptx.inst.add.u32(krow, krow, BN)
+                    ptx.inst.add.u32(vrow, vrow, BN)
+                    it += 1
+                    ptx.inst.setp.lt.u32(go, it, n_tiles)
+
+        # =============================================================
+        # MMA dispatch warp
+        # =============================================================
+        with ptx.if_(is_mma):
+            idesc_qk = reg.scalar(
+                b32,
+                init=ptx.tcgen05.make_instr_desc_f16bf16_f32(
+                    m=128, n=64, ab_dtype="bf16", a_major="K", b_major="K"
+                ),
+            )
+            idesc_pv = reg.scalar(
+                b32,
+                init=ptx.tcgen05.make_instr_desc_f16bf16_f32(
+                    m=128, n=HD, ab_dtype="bf16", a_major="K", b_major="MN"
+                ),
+            )
+            p_acc = reg.scalar(pred)
+            p_noacc = reg.scalar(pred)
+            with ptx.scope():
+                one = reg.scalar(u32, init=1)
+                zero = reg.scalar(u32, init=0)
+                ptx.inst.setp.ne.b32(p_acc, one, 0)
+                ptx.inst.setp.ne.b32(p_noacc, zero, 0)
+
+            dq0 = ptx.tcgen05.masked_descriptor(base + O2_SMEM_Q)
+            dh = [
+                ptx.tcgen05.masked_descriptor(base + O2_SMEM_H + h * O2_HALF_BYTES)
+                for h in range(2)
+            ]
+            dv = [
+                ptx.tcgen05.descriptor(
+                    base + O2_SMEM_H + (2 + h) * O2_HALF_BYTES,
+                    stride_bytes=1024, leading_bytes=8192, swizzle="128B",
+                )
+                for h in range(2)
+            ]
+
+            ph_h = [reg.scalar(b32, init=0) for _ in range(4)]
+            ph_p = reg.scalar(b32, init=0)
+            ph_or = reg.scalar(b32, init=0)
+            ph_q = reg.scalar(b32, init=0)
+
+            def wait_h(h):
+                ptx.mbarrier.wait(base + O2B_H_FULL + 8 * h, ph_h[h])
+                ptx.inst.xor.b32(ph_h[h], ph_h[h], 1)
+
+            def khalf_off(kk):
+                # K half: 64 rows x 128 cols as two 8 KB stripes
+                return (kk // 4) * 512 + (kk % 4) * 2
+
+            def qk_mma_half(h):
+                d = tmem + (O2_TM_S + 64 * h)
+                for kk in range(8):
+                    offa = _kmajor_desc_off(kk)
+                    offb = khalf_off(kk)
+                    da = dq0 if offa == 0 else reg.scalar(b64)
+                    if offa:
+                        ptx.inst.add.s64(da, dq0, offa)
+                    db = dh[h] if offb == 0 else reg.scalar(b64)
+                    if offb:
+                        ptx.inst.add.s64(db, dh[h], offb)
+                    ptx.tcgen05.mma(
+                        d, da, db, idesc_qk, kind="f16",
+                        pred_operand=(p_noacc if kk == 0 else p_acc),
+                    )
+                ptx.tcgen05.commit(base + O2B_H_FREE + 8 * h)
+
+            def pv_mma_half(h, first_tile):
+                d = tmem + O2_TM_O
+                for kk in range(4 * h, 4 * h + 4):
+                    a = tmem + (O2_TM_S + kk * 8)
+                    db = dv[h] if kk % 4 == 0 else reg.scalar(b64)
+                    if kk % 4:
+                        ptx.inst.add.s64(db, dv[h], (kk % 4) * 128)
+                    ptx.tcgen05.mma(
+                        d, a, db, idesc_pv, kind="f16", a_is_tmem=True,
+                        pred_operand=(p_noacc if (first_tile and kk == 0) else p_acc),
+                    )
+                ptx.tcgen05.commit(base + O2B_H_FREE + 8 * (2 + h))
+
+            def tile_mma(first_tile):
+                wait_h(0)
+                qk_mma_half(0)
+                wait_h(1)
+                qk_mma_half(1)
+                ptx.tcgen05.commit(base + O2B_S_FULL)
+                ptx.mbarrier.wait(base + O2B_P_FULL, ph_p)
+                ptx.inst.xor.b32(ph_p, ph_p, 1)
+                ptx.mbarrier.wait(base + O2B_O_RESC, ph_or)
+                ptx.inst.xor.b32(ph_or, ph_or, 1)
+                ptx.tcgen05.fence_after_thread_sync()
+                wait_h(2)
+                pv_mma_half(0, first_tile)
+                wait_h(3)
+                pv_mma_half(1, first_tile)
+
+            ptx.mbarrier.wait(base + O2B_Q, ph_q)
+            tile_mma(True)
+            if n_tiles > 1:
+                it = reg.scalar(u32, init=1)
+                go = reg.scalar(pred)
+                ptx.inst.setp.lt.u32(go, it, n_tiles)
+                with ptx.loop("o2_mma_loop", pred=go):
+                    tile_mma(False)
+                    it += 1
+                    ptx.inst.setp.lt.u32(go, it, n_tiles)
+            ptx.tcgen05.commit(base + O2B_O_DONE)
+
+        # =============================================================
+        # Softmax warps (tids 0-127, one full row each; 112 regs, so the
+        # row is processed in 64-column halves with a reload pass)
+        # =============================================================
+        with ptx.if_(is_softmax):
+            row128 = make_row128()
+            lane_addr_bits = make_lane_bits()
+            s_lo = reg.scalar(b32)
+            ptx.inst.mov.b32(s_lo, tmem)
+            ptx.inst.add.u32(s_lo, s_lo, lane_addr_bits)
+            p_lo = reg.scalar(b32)
+            ptx.inst.mov.b32(p_lo, s_lo)
+
+            qk_scale_reg = reg.scalar(f32, init=qk_scale)
+            neg_thresh = reg.scalar(f32, init=-rescale_threshold)
+            one_f = reg.scalar(f32, init=1.0)
+            m_run = reg.scalar(f32, init=-1e30)
+            l_run = reg.scalar(f32, init=0.0)
+
+            alpha_addr = reg.scalar(u32)
+            ptx.inst.shl.b32(alpha_addr, row128, 2)
+            ptx.inst.add.u32(alpha_addr, alpha_addr, base + O2_SMEM_STATS)
+            sum_addr = reg.scalar(u32)
+            ptx.inst.add.u32(sum_addr, alpha_addr, 512)
+
+            ph_s = reg.scalar(b32, init=0)
+            ph_stats = reg.scalar(b32, init=0)
+
+            vals = reg.array(f32, 32)
+            packed = reg.array(b32, 16)
+
+            def ld_quarter(q):
+                addr = reg.scalar(b32)
+                ptx.inst.add.u32(addr, s_lo, q * 32)
+                ptx.tcgen05.ld(vals, addr, shape="32x32b", count=32, dtype="b32")
+                ptx.tcgen05.wait_ld()
+
+            def q_max(dst, first):
+                acc = [reg.scalar(f32) for _ in range(4)]
+                for a in range(4):
+                    ptx.inst.max.f32(acc[a], vals[a], vals[4 + a], vals[8 + a])
+                for a in range(4):
+                    ptx.inst.max.f32(acc[a], acc[a], vals[12 + a], vals[16 + a])
+                for a in range(4):
+                    ptx.inst.max.f32(acc[a], acc[a], vals[20 + a], vals[24 + a])
+                for a in range(4):
+                    ptx.inst.max.f32(acc[a], acc[a], vals[28 + a])
+                ptx.inst.max.f32(acc[0], acc[0], acc[1], acc[2])
+                if first:
+                    ptx.inst.max.f32(dst, acc[0], acc[3])
+                else:
+                    ptx.inst.max.f32(dst, dst, acc[0], acc[3])
+
+            def body(is_first: bool):
+                ptx.mbarrier.wait(base + O2B_S_FULL, ph_s)
+                ptx.inst.xor.b32(ph_s, ph_s, 1)
+                ptx.tcgen05.fence_after_thread_sync()
+
+                # max pass over four 32-column quarters
+                pmax = reg.scalar(f32)
+                for q in range(4):
+                    ld_quarter(q)
+                    q_max(pmax, q == 0)
+
+                alpha = reg.scalar(f32)
+                if not is_first:
+                    m_new = reg.scalar(f32)
+                    ptx.inst.max.f32(m_new, m_run, pmax)
+                    d = reg.scalar(f32)
+                    ptx.inst.sub.f32(d, m_run, m_new)
+                    ptx.inst.mul.f32(d, d, qk_scale_reg)
+                    keep = reg.scalar(pred)
+                    ptx.inst.setp.ge.f32(keep, d, neg_thresh)
+                    with ptx.if_(keep):
+                        ptx.inst.mov.f32(alpha, one_f)
+                    with ptx.else_():
+                        ptx.inst.ex2.approx.ftz.f32(alpha, d)
+                        ptx.inst.mov.f32(m_run, m_new)
+                    ptx.mbarrier.wait(base + O2B_STATS_FREE, ph_stats)
+                    ptx.inst.xor.b32(ph_stats, ph_stats, 1)
+                    ptx.inst.st.shared.b32(ptx.addr(alpha_addr), alpha)
+                    ptx.mbarrier.arrive(base + O2B_STATS_FULL)
+                else:
+                    ptx.inst.mov.f32(m_run, pmax)
+
+                m_scaled = reg.scalar(f32)
+                ptx.inst.mul.f32(m_scaled, m_run, qk_scale_reg)
+                ptx.inst.neg.f32(m_scaled, m_scaled)
+
+                # exp pass, quarter q's P words land on S columns already
+                # consumed by quarter q (sequential overwrite is safe)
+                lsum = reg.scalar(f32, init=0.0)
+                for q in range(4):
+                    ld_quarter(q)
+                    for i in range(32):
+                        ptx.inst.fma.rn.f32(vals[i], vals[i], qk_scale_reg, m_scaled)
+                        ptx.inst.ex2.approx.ftz.f32(vals[i], vals[i])
+                    for c in range(16):
+                        ptx.inst.cvt.rn.bf16x2.f32(
+                            packed[c], vals[2 * c + 1], vals[2 * c]
+                        )
+                    pa = reg.scalar(b32)
+                    ptx.inst.add.u32(pa, p_lo, q * 16)
+                    ptx.tcgen05.st(pa, packed, shape="32x32b", count=16, dtype="b32")
+                    acc = [reg.scalar(f32) for _ in range(4)]
+                    for a in range(4):
+                        ptx.inst.add.f32(acc[a], vals[a], vals[4 + a])
+                    for i in range(8, 32, 4):
+                        for a in range(4):
+                            ptx.inst.add.f32(acc[a], acc[a], vals[i + a])
+                    ptx.inst.add.f32(acc[0], acc[0], acc[1])
+                    ptx.inst.add.f32(acc[2], acc[2], acc[3])
+                    ptx.inst.add.f32(acc[0], acc[0], acc[2])
+                    ptx.inst.add.f32(lsum, lsum, acc[0])
+                ptx.tcgen05.wait_st()
+                ptx.tcgen05.fence_before_thread_sync()
+                ptx.mbarrier.arrive(base + O2B_P_FULL)
+
+                if is_first:
+                    ptx.inst.mov.f32(l_run, lsum)
+                else:
+                    ptx.inst.fma.rn.f32(l_run, l_run, alpha, lsum)
+
+            body(is_first=True)
+            if n_tiles > 1:
+                it = reg.scalar(u32, init=1)
+                go = reg.scalar(pred)
+                ptx.inst.setp.lt.u32(go, it, n_tiles)
+                with ptx.loop("o2_softmax_loop", pred=go):
+                    body(is_first=False)
+                    it += 1
+                    ptx.inst.setp.lt.u32(go, it, n_tiles)
+
+            ptx.inst.st.shared.b32(ptx.addr(sum_addr), l_run)
+            ptx.mbarrier.arrive(base + O2B_STATS_FULL)
+
+        # =============================================================
+        # Correction warps (tids 128-255): O rescale + epilogue
+        # =============================================================
+        with ptx.if_(is_correction):
+            row128 = make_row128()
+            lane_addr_bits = make_lane_bits()
+            q_row0 = make_q_row0()
+            one_f = reg.scalar(f32, init=1.0)
+            alpha_addr = reg.scalar(u32)
+            ptx.inst.shl.b32(alpha_addr, row128, 2)
+            ptx.inst.add.u32(alpha_addr, alpha_addr, base + O2_SMEM_STATS)
+            o_addr = reg.scalar(b32)
+            ptx.inst.mov.b32(o_addr, tmem)
+            ptx.inst.add.u32(o_addr, o_addr, O2_TM_O)
+            ptx.inst.add.u32(o_addr, o_addr, lane_addr_bits)
+
+            ptx.mbarrier.arrive(base + O2B_O_RESC)
+            ptx.mbarrier.arrive(base + O2B_STATS_FREE)
+
+            ovals = reg.array(f32, 32)
+
+            if n_tiles > 1:
+                ph_sf = reg.scalar(b32, init=0)
+                it = reg.scalar(u32, init=1)
+                go = reg.scalar(pred)
+                ptx.inst.setp.lt.u32(go, it, n_tiles)
+                with ptx.loop("o2_corr_loop", pred=go):
+                    ptx.mbarrier.wait(base + O2B_STATS_FULL, ph_sf)
+                    ptx.inst.xor.b32(ph_sf, ph_sf, 1)
+                    alpha = reg.scalar(f32)
+                    av = smem.load(b32, ptx.addr(alpha_addr))
+                    ptx.inst.mov.b32(alpha, av)
+                    ptx.mbarrier.arrive(base + O2B_STATS_FREE)
+                    need = reg.scalar(pred)
+                    ptx.inst.setp.lt.f32(need, alpha, one_f)
+                    ballot = reg.scalar(b32)
+                    ptx.inst.vote.sync.ballot.b32(ballot, need, 0xFFFFFFFF)
+                    any_need = reg.scalar(pred)
+                    ptx.inst.setp.ne.b32(any_need, ballot, 0)
+                    with ptx.if_(any_need):
+                        ptx.tcgen05.fence_after_thread_sync()
+                        for quarter in range(4):
+                            addr = reg.scalar(b32)
+                            ptx.inst.add.u32(addr, o_addr, quarter * 32)
+                            ptx.tcgen05.ld(ovals, addr, shape="32x32b", count=32, dtype="b32")
+                            ptx.tcgen05.wait_ld()
+                            for i in range(32):
+                                ptx.inst.mul.f32(ovals[i], ovals[i], alpha)
+                            ptx.tcgen05.st(addr, ovals, shape="32x32b", count=32, dtype="b32")
+                        ptx.tcgen05.wait_st()
+                        ptx.tcgen05.fence_before_thread_sync()
+                    ptx.mbarrier.arrive(base + O2B_O_RESC)
+                    it += 1
+                    ptx.inst.setp.lt.u32(go, it, n_tiles)
+
+            done_phase = reg.scalar(b32, init=0)
+            ptx.mbarrier.wait(base + O2B_O_DONE, done_phase)
+            ptx.tcgen05.fence_after_thread_sync()
+
+            # final stats
+            ptx.mbarrier.wait(base + O2B_STATS_FULL, (n_tiles - 1) & 1)
+            (po,) = ptx.global_ptrs(O)
+            out_row = reg.scalar(u32)
+            ptx.inst.add.u32(out_row, q_row0, row128)
+            l = reg.scalar(f32)
+            lv = smem.load(b32, ptx.addr(alpha_addr + 512))
+            ptx.inst.mov.b32(l, lv)
+            inv_l = reg.scalar(f32)
+            ptx.inst.rcp.approx.f32(inv_l, l)
+            byte_off = reg.scalar(u64)
+            ptx.inst.mul.wide.u32(byte_off, out_row, HD * 2)
+            gptr = po + byte_off
+            opacked = reg.array(b32, 16)
+            for quarter in range(4):
+                addr = reg.scalar(b32)
+                ptx.inst.add.u32(addr, o_addr, quarter * 32)
+                ptx.tcgen05.ld(ovals, addr, shape="32x32b", count=32, dtype="b32")
+                ptx.tcgen05.wait_ld()
+                for i in range(32):
+                    ptx.inst.mul.f32(ovals[i], ovals[i], inv_l)
+                for c in range(16):
+                    ptx.inst.cvt.rn.bf16x2.f32(
+                        opacked[c], ovals[2 * c + 1], ovals[2 * c]
+                    )
+                for vec in range(4):
+                    ptx.inst.st.global_.v4.b32(
+                        ptx.addr(gptr, quarter * 64 + vec * 16),
+                        [opacked[vec * 4 + k] for k in range(4)],
+                    )
+
+        ptx.bar.sync(0, 384)
+        with ptx.if_(alloc_warp):
+            ptx.tcgen05.dealloc(tmem, 256)
+        ptx.ret()
+
+    return flash_attn_fwd_occ2
+
+
+# =====================================================================
+# test / benchmark
+# =====================================================================
+
+def _test_case(B: int, H: int, S: int, D: int = 128) -> bool:
+    import torch
+
+    k_fn = build_flash_attention_blackwell(S, B * H, D)
+    torch.manual_seed(0)
+    q = torch.randn(B, H, S, D, device="cuda", dtype=torch.bfloat16) * 0.5
+    k = torch.randn(B, H, S, D, device="cuda", dtype=torch.bfloat16) * 0.5
+    v = torch.randn(B, H, S, D, device="cuda", dtype=torch.bfloat16)
+    out = k_fn(q.reshape(-1, D), k.reshape(-1, D), v.reshape(-1, D))
+    out = out.reshape(B, H, S, D)
+    torch.cuda.synchronize()
+    ref = torch.nn.functional.scaled_dot_product_attention(
+        q.float(), k.float(), v.float()
+    )
+    diff = (out.float() - ref).abs()
+    rel = diff.max() / ref.abs().max()
+    ok = bool(diff.max() < 0.05)
+    print(
+        f"[{'OK  ' if ok else 'FAIL'}] B={B} H={H} S={S} D={D} "
+        f"max_abs={diff.max():.4e} mean_abs={diff.mean():.4e} rel={rel:.3e}"
+    )
+    return ok
+
+
+def main() -> None:
+    ok = True
+    for B, H, S in ((1, 1, 256), (1, 2, 512), (2, 4, 1024), (1, 8, 4096)):
+        ok &= _test_case(B, H, S)
+    raise SystemExit(0 if ok else 1)
+
+
+if __name__ == "__main__":
+    main()
