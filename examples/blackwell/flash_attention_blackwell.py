@@ -1168,14 +1168,14 @@ B2_Q = SMEM2_BARS + 0             # 8   (lead-tracked, both CTAs' Q)
 B2_KV_FULL = SMEM2_BARS + 8       # 4 x 8 (lead-tracked)
 B2_KV_FREE = SMEM2_BARS + 40      # 4 x 8 (local, multicast commit)
 B2_S_FULL = SMEM2_BARS + 72       # 2 x 8 (local, multicast commit)
-B2_P_FULL = SMEM2_BARS + 88       # 2 x 8 (lead, count 256)
-B2_O_RESC = SMEM2_BARS + 104      # 2 x 8 (lead, count 256)
-B2_O_DONE = SMEM2_BARS + 120      # 8   (local, multicast commit)
-B2_STATS_FREE = SMEM2_BARS + 128  # 2 x 8 (local)
-B2_STATS_FULL = SMEM2_BARS + 144  # 2 x 8 (beacon mode only)
-B2_Q_FREE = SMEM2_BARS + 160      # 8 (persistent: Q smem free, local per CTA)
-B2_EPI = SMEM2_BARS + 168         # 8 (softmax item-start gate, local per CTA)
-SMEM2_TMEM_SLOT = SMEM2_BARS + 176
+B2_P_FULL = SMEM2_BARS + 88       # [stage][half]: 4 x 8 (lead, count 256)
+B2_O_RESC = SMEM2_BARS + 120      # 2 x 8 (lead, count 256)
+B2_O_DONE = SMEM2_BARS + 136      # 8   (local, multicast commit)
+B2_STATS_FREE = SMEM2_BARS + 144  # 2 x 8 (local)
+B2_STATS_FULL = SMEM2_BARS + 160  # 2 x 8 (local)
+B2_Q_FREE = SMEM2_BARS + 176      # 8 (persistent: Q smem free, local per CTA)
+B2_EPI = SMEM2_BARS + 184         # 8 (softmax item-start gate, local per CTA)
+SMEM2_TMEM_SLOT = SMEM2_BARS + 192
 SMEM2_BYTES = SMEM2_TMEM_SLOT + 16
 
 
@@ -1306,7 +1306,8 @@ def build_flash_attention_blackwell_2cta(
                 ptx.mbarrier.init(base + B2_KV_FREE + 8 * s, 1)
             for i in range(2):
                 ptx.mbarrier.init(base + B2_S_FULL + 8 * i, 1)
-                ptx.mbarrier.init(base + B2_P_FULL + 8 * i, 256)
+                for h in range(2):
+                    ptx.mbarrier.init(base + B2_P_FULL + 16 * i + 8 * h, 256)
                 ptx.mbarrier.init(base + B2_O_RESC + 8 * i, 256)
                 ptx.mbarrier.init(base + B2_STATS_FREE + 8 * i, 128)
                 ptx.mbarrier.init(base + B2_STATS_FULL + 8 * i, 128)
@@ -1549,7 +1550,9 @@ def build_flash_attention_blackwell_2cta(
                 )
 
             ph_kv = [reg.scalar(b32, init=0) for _ in range(KV_SLOTS)]
-            ph_p = [reg.scalar(b32, init=0) for _ in range(Q_STAGE)]
+            ph_p = [
+                [reg.scalar(b32, init=0) for _ in range(2)] for _ in range(Q_STAGE)
+            ]
             ph_or = [reg.scalar(b32, init=0) for _ in range(Q_STAGE)]
 
             def wait_kv(slot: int):
@@ -1564,14 +1567,21 @@ def build_flash_attention_blackwell_2cta(
 
             def pv_mma(stage: int, v_idx: int, first_accum: bool):
                 d = tmem + TM_O[stage]
-                bwait(base + B2_P_FULL + 8 * stage, ph_p[stage], 3, stage)
-                ph_p[stage] ^= 1
+                # consume P per 64-column half: kk 0-3 start while the
+                # softmax groups still stream the second half
+                bwait(base + B2_P_FULL + 16 * stage, ph_p[stage][0], 3, stage)
+                ph_p[stage][0] ^= 1
                 bwait(base + B2_O_RESC + 8 * stage, ph_or[stage], 4, stage)
                 ph_or[stage] ^= 1
                 ptx.tcgen05.fence_after_thread_sync()
                 for kk in range(8):
                     if debug_mma_level < 2:
                         break
+                    if kk == 4:
+                        bwait(base + B2_P_FULL + 16 * stage + 8,
+                              ph_p[stage][1], 3, stage)
+                        ph_p[stage][1] ^= 1
+                        ptx.tcgen05.fence_after_thread_sync()
                     a = tmem + (TM_P[stage] + kk * 8)
                     off_b = v_idx * 2 * SLOT_UNITS_2 + kk * 128
                     db = dv0 if off_b == 0 else reg.scalar(b64)
@@ -1682,8 +1692,12 @@ def build_flash_attention_blackwell_2cta(
             ptx.inst.add.u32(p_lo, p_lo, TM_P[stage])
             ptx.inst.add.u32(p_lo, p_lo, lane_addr_bits)
 
-            p_full_addr = reg.scalar(u32, init=0)
-            ptx.inst.add.u32(p_full_addr, p_full_addr, base + B2_P_FULL + 8 * stage)
+            p_half_addr = [reg.scalar(u32, init=0) for _ in range(2)]
+            for h in range(2):
+                ptx.inst.add.u32(
+                    p_half_addr[h], p_half_addr[h],
+                    base + B2_P_FULL + 16 * stage + 8 * h,
+                )
 
             qk_scale_reg = reg.scalar(f32, init=qk_scale)
             thresh_p = reg.scalar(f32, init=float(2.0 ** rescale_threshold))
@@ -1768,7 +1782,10 @@ def build_flash_attention_blackwell_2cta(
                     ptx.mbarrier.arrive(base + B2_STATS_FULL + 8 * stage)
 
                 # ---- stream 4 chunks: ld(c+1) flies under exp/store(c);
-                # stale basis, no tile max in front of the exps ----
+                # stale basis, no tile max in front of the exps. Each
+                # 64-column HALF publishes to the lead as soon as its two
+                # chunks are stored, so the pair-wide PV starts while the
+                # second half is still streaming ----
                 for c in range(4):
                     ptx.tcgen05.wait_ld()
                     if c < 3:
@@ -1783,16 +1800,16 @@ def build_flash_attention_blackwell_2cta(
                     pa = reg.scalar(b32)
                     ptx.inst.add.u32(pa, p_lo, c * 16)
                     ptx.tcgen05.st(pa, packed, shape="32x32b", count=16, dtype="b32")
+                    if c == 1 or c == 3:
+                        ptx.tcgen05.wait_st()
+                        ptx.tcgen05.fence_before_thread_sync()
+                        ptx.cluster.arrive_remote(p_half_addr[c // 2], rank0)
                     chunk_reduce(v, c)
                 progress(1 + stage, tcount)
-
-                ptx.tcgen05.wait_st()
                 progress(3 + stage, tcount)
                 if debug_beacon:
                     ptx.inst.add.u32(tcount, tcount, 1)
-                ptx.tcgen05.fence_before_thread_sync()
                 progress(8, tcount)
-                ptx.cluster.arrive_remote(p_full_addr, rank0)
                 progress(9, tcount)
 
                 # horizontal reduce into the pending carries (exp2 is
@@ -1842,7 +1859,9 @@ def build_flash_attention_blackwell_2cta(
 
         def plumbing_softmax(stage: int):
             pf = reg.scalar(u32, init=0)
-            ptx.inst.add.u32(pf, pf, base + B2_P_FULL + 8 * stage)
+            ptx.inst.add.u32(pf, pf, base + B2_P_FULL + 16 * stage)
+            pf2 = reg.scalar(u32, init=0)
+            ptx.inst.add.u32(pf2, pf2, base + B2_P_FULL + 16 * stage + 8)
             ph_s = reg.scalar(b32, init=0)
             it = reg.scalar(u32, init=0)
             go = reg.scalar(pred)
@@ -1852,13 +1871,16 @@ def build_flash_attention_blackwell_2cta(
                     ptx.mbarrier.wait(base + B2_S_FULL + 8 * stage, ph_s)
                     ptx.inst.xor.b32(ph_s, ph_s, 1)
                 ptx.cluster.arrive_remote(pf, rank0)
+                ptx.cluster.arrive_remote(pf2, rank0)
                 it += 1
                 ptx.inst.setp.lt.u32(go, it, n_tiles)
 
         def paced_sim_softmax(stage: int):
             # real pacing: wait local S_FULL then remote-arrive P_FULL
             pf = reg.scalar(u32, init=0)
-            ptx.inst.add.u32(pf, pf, base + B2_P_FULL + 8 * stage)
+            ptx.inst.add.u32(pf, pf, base + B2_P_FULL + 16 * stage)
+            pf2 = reg.scalar(u32, init=0)
+            ptx.inst.add.u32(pf2, pf2, base + B2_P_FULL + 16 * stage + 8)
             ph_s = reg.scalar(b32, init=0)
             it = reg.scalar(u32, init=0)
             go = reg.scalar(pred)
@@ -1867,6 +1889,7 @@ def build_flash_attention_blackwell_2cta(
                 ptx.mbarrier.wait(base + B2_S_FULL + 8 * stage, ph_s)
                 ptx.inst.xor.b32(ph_s, ph_s, 1)
                 ptx.cluster.arrive_remote(pf, rank0)
+                ptx.cluster.arrive_remote(pf2, rank0)
                 it += 1
                 ptx.inst.setp.lt.u32(go, it, n_tiles)
 
