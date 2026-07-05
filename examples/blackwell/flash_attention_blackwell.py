@@ -523,8 +523,8 @@ def build_flash_attention_blackwell(
 
                 # ---- peeled j=0: PV(0) with V slot 1, S(1) with K slot 2 ----
                 wait_kv(1)
-                pv_mma(0, 0, first_accum=True, par=0)
                 wait_kv(2)
+                pv_mma(0, 0, first_accum=True, par=0)
                 qk_mma(0, 1)
                 pv_mma(1, 0, first_accum=True, par=0)
                 qk_mma(1, 1)
@@ -538,21 +538,25 @@ def build_flash_attention_blackwell(
                     go = reg.scalar(pred)
                     ptx.inst.setp.lt.u32(go, trip, trips)
                     with ptx.loop("mma_loop", pred=go):
-                        # j odd: V in slot 3, next K in slot 0
+                        # j odd: V in slot 3, next K in slot 0. KV waits
+                        # are hoisted: KV normally arrives early (the
+                        # load warp runs ahead) while P quarters are the
+                        # tight resource, so the warp should not block
+                        # between a PV and its following QK — the QK
+                        # UMMAs queue behind the PVs and keep the tensor
+                        # core fed through quarter stalls.
                         wait_kv(3)
+                        wait_kv(0)
                         for stage in range(Q_STAGE):
                             pv_mma(stage, 1, first_accum=False, par=1)
-                            if stage == 0:
-                                wait_kv(0)
                             qk_mma(stage, 0)
                         ptx.tcgen05.commit(base + BAR_KV_FREE + 8 * 0)
                         ptx.tcgen05.commit(base + BAR_KV_FREE + 8 * 3)
                         # j even: V in slot 1, next K in slot 2
                         wait_kv(1)
+                        wait_kv(2)
                         for stage in range(Q_STAGE):
                             pv_mma(stage, 0, first_accum=False, par=0)
-                            if stage == 0:
-                                wait_kv(2)
                             qk_mma(stage, 1)
                         ptx.tcgen05.commit(base + BAR_KV_FREE + 8 * 2)
                         ptx.tcgen05.commit(base + BAR_KV_FREE + 8 * 1)
