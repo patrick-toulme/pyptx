@@ -1632,9 +1632,13 @@ def build_flash_attention_blackwell_2cta(
             ptx.inst.add.u32(p_full_addr, p_full_addr, base + B2_P_FULL + 8 * stage)
 
             qk_scale_reg = reg.scalar(f32, init=qk_scale)
-            neg_thresh = reg.scalar(f32, init=-rescale_threshold)
+            thresh_p = reg.scalar(f32, init=float(2.0 ** rescale_threshold))
             one_f = reg.scalar(f32, init=1.0)
-            m_run = reg.scalar(f32, init=-1e30)
+            # stale-basis state (see the 1-CTA builder): exp against the
+            # pending basis immediately; the max/decision defers one tile
+            mneg = reg.scalar(f32, init=0.0)
+            pmax_pend = reg.scalar(f32, init=0.0)
+            sums_pend = reg.scalar(f32, init=0.0)
             l_run = reg.scalar(f32, init=0.0)
 
             alpha_addr = reg.scalar(u32)
@@ -1696,43 +1700,35 @@ def build_flash_attention_blackwell_2cta(
                 ptx.inst.xor.b32(ph_s, ph_s, 1)
                 ptx.tcgen05.fence_after_thread_sync()
 
+                # issue both S loads, then run the PREVIOUS tile's
+                # deferred basis decision in their latency shadow
                 ptx.tcgen05.ld(vals_lo, s_lo, shape="32x32b", count=64, dtype="b32")
                 ptx.tcgen05.ld(vals_hi, s_hi, shape="32x32b", count=64, dtype="b32")
-                ptx.tcgen05.wait_ld()
-                progress(1 + stage, tcount)
-                max_a = reg.scalar(f32)
-                tile_max(max_a, vals_lo)
-                max_b = reg.scalar(f32)
-                tile_max(max_b, vals_hi)
-                ptx.inst.max.f32(max_b, max_b, max_a)
 
                 alpha = reg.scalar(f32)
                 if not is_first:
-                    m_new = reg.scalar(f32)
-                    ptx.inst.max.f32(m_new, m_run, max_b)
-                    d = reg.scalar(f32)
-                    ptx.inst.sub.f32(d, m_run, m_new)
-                    ptx.inst.mul.f32(d, d, qk_scale_reg)
-                    keep = reg.scalar(pred)
-                    ptx.inst.setp.ge.f32(keep, d, neg_thresh)
-                    with ptx.if_(keep):
-                        ptx.inst.mov.f32(alpha, one_f)
-                    with ptx.else_():
-                        ptx.inst.ex2.approx.ftz.f32(alpha, d)
-                        ptx.inst.mov.f32(m_run, m_new)
+                    ptx.inst.mov.f32(alpha, one_f)
+                    move = reg.scalar(pred)
+                    ptx.inst.setp.gt.f32(move, pmax_pend, thresh_p)
+                    with ptx.if_(move):
+                        ptx.inst.rcp.approx.f32(alpha, pmax_pend)
+                        lgp = reg.scalar(f32)
+                        ptx.inst.lg2.approx.f32(lgp, pmax_pend)
+                        ptx.inst.sub.f32(mneg, mneg, lgp)
+                    ptx.inst.add.f32(l_run, l_run, sums_pend)
+                    ptx.inst.mul.f32(l_run, l_run, alpha)
                     bwait(base + B2_STATS_FREE + 8 * stage, ph_stats, 6, stage)
                     ptx.inst.xor.b32(ph_stats, ph_stats, 1)
                     ptx.inst.st.shared.b32(ptx.addr(alpha_addr), alpha)
                     ptx.mbarrier.arrive(base + B2_STATS_FULL + 8 * stage)
-                else:
-                    ptx.inst.mov.f32(m_run, max_b)
 
-                m_scaled = reg.scalar(f32)
-                ptx.inst.mul.f32(m_scaled, m_run, qk_scale_reg)
-                ptx.inst.neg.f32(m_scaled, m_scaled)
+                ptx.tcgen05.wait_ld()
+                progress(1 + stage, tcount)
 
-                exp_pack_store(vals_lo, m_scaled, p_lo, 0)
-                exp_pack_store(vals_hi, m_scaled, p_lo, 32)
+                # stale basis: exp everything against the pending basis
+                # immediately — no tile max in front of the exps
+                exp_pack_store(vals_lo, mneg, p_lo, 0)
+                exp_pack_store(vals_hi, mneg, p_lo, 32)
                 ptx.tcgen05.wait_st()
                 progress(3 + stage, tcount)
                 if debug_beacon:
@@ -1742,15 +1738,18 @@ def build_flash_attention_blackwell_2cta(
                 ptx.cluster.arrive_remote(p_full_addr, rank0)
                 progress(9, tcount)
 
+                # deferred reductions on the exp'd values (exp2 is
+                # monotonic; pmax > 2^thresh means the basis drifted)
+                max_a = reg.scalar(f32)
+                tile_max(max_a, vals_lo)
+                max_b = reg.scalar(f32)
+                tile_max(max_b, vals_hi)
+                ptx.inst.max.f32(pmax_pend, max_b, max_a)
                 sum_a = reg.scalar(f32)
                 sum_b = reg.scalar(f32)
                 sum_half(vals_lo, sum_a)
                 sum_half(vals_hi, sum_b)
-                ptx.inst.add.f32(sum_a, sum_a, sum_b)
-                if is_first:
-                    ptx.inst.mov.f32(l_run, sum_a)
-                else:
-                    ptx.inst.fma.rn.f32(l_run, l_run, alpha, sum_a)
+                ptx.inst.add.f32(sums_pend, sum_a, sum_b)
                 progress(10, tcount)
 
             body(is_first=True)
@@ -1763,6 +1762,9 @@ def build_flash_attention_blackwell_2cta(
                 ptx.inst.setp.lt.u32(go, it, n_tiles)
 
             progress(6)
+            # drain: the last tile's basis decision never runs — the
+            # pending rescale cancels between O and l in the epilogue
+            ptx.inst.add.f32(l_run, l_run, sums_pend)
             ptx.inst.st.shared.b32(ptx.addr(sum_addr), l_run)
             ptx.mbarrier.arrive(base + B2_STATS_FULL + 8 * stage)
             progress(7)
