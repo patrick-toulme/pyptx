@@ -813,12 +813,24 @@ class Kernel:
     def _emit_optimized(self, module) -> str:
         """Emit PTX, optionally running the IR optimization pipeline.
 
-        Gated by the PYPTX_OPT env var (0=off/byte-identical, 1=GVN+LICM
-        of invariant address arithmetic, 2=+register/scheduling passes).
-        Default off so traced output is unchanged until a level is opted
-        into. The pipeline self-verifies and falls back on any anomaly.
+        Selection:
+          * PYPTX_PASSES — comma-separated pass names run in order, e.g.
+            "gvn,dce,regalloc" or "gvn,ssa,schedule". Overrides PYPTX_OPT.
+          * PYPTX_OPT — numeric preset (0=off/byte-identical default, 1=the
+            low-risk removal set gvn+dce, 2=+value splitting, 3=+regalloc,
+            4=+scheduling, 5=+ssa). See pyptx.ir.optimize._LEVEL_PRESETS.
+
+        Default off, so traced output is byte-identical until opted into.
+        Every pass self-verifies and is skipped on any structural anomaly.
         """
         import os
+        passes_env = os.environ.get("PYPTX_PASSES")
+        if passes_env:
+            passes = [p.strip() for p in passes_env.split(",") if p.strip()]
+            if passes:
+                from pyptx.ir.optimize import optimize_module
+                module = optimize_module(module, passes=passes)
+            return emit(module)
         level_s = os.environ.get("PYPTX_OPT", "0") or "0"
         try:
             level = int(level_s)

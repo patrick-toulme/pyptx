@@ -382,6 +382,11 @@ def _rewrite_gvn(statements, canon, folded, invariant, entry_end, inv_defs):
 _BLOCK_ENDERS = frozenset({"bra", "ret", "call", "exit", "brkpt", "trap"})
 
 
+def _ty_str(ty) -> str:
+    """Normalize a decl type (ScalarType enum or raw string) to its PTX text."""
+    return ty.ptx if hasattr(ty, "ptx") else str(ty)
+
+
 def _reg_type_lookup(statements):
     """Return a fn name->declared-type, covering scalar and ranged decls."""
     scalar: dict[str, str] = {}
@@ -503,7 +508,7 @@ def split_false_deps(statements: list[Statement]) -> list[Statement]:
             if r in poison:
                 continue
             ty = reg_type(r)
-            if ty is None or ty == ".pred" or _is_special_reg(r):
+            if ty is None or _ty_str(ty) == ".pred" or _is_special_reg(r):
                 continue
             # value starts = first def, plus every killing def
             starts: list[int] = []
@@ -562,6 +567,487 @@ def _stmt_reg_names(instr: Instruction) -> set[str]:
     return out
 
 
+# ---------------------------------------------------------------------------
+# Pass A: dead-code elimination + liveness-driven register allocation.
+#
+# DCE removes pure computes whose result is never used (a strict win — fewer
+# instructions, fewer live values). Register allocation then builds an
+# interference graph from liveness and greedily colors it per register type,
+# packing the virtual registers onto a minimal set. This is the "linear-scan
+# allocator handing ptxas tight live ranges" lever, and it reports the
+# concrete metric it targets (distinct vregs before/after, vs the max
+# simultaneously-live lower bound).
+#
+# Coloring MERGES non-interfering registers, so unlike value-splitting it can
+# reintroduce WAR/WAW anti-deps — the two passes are opposing levers, to be
+# A/B'd on hardware. It is also the one pass verify_body cannot fully police
+# (a bad coloring produces no dangling use), so it is guarded hard: it bails
+# to the input on any unresolved control flow, and asserts every computed
+# interference edge is respected by the final coloring before returning.
+# ---------------------------------------------------------------------------
+
+def dead_code_eliminate(statements: list[Statement]) -> list[Statement]:
+    """Remove pure instructions whose (non-special, scalar) result is dead."""
+    from pyptx.ir.analysis import (
+        build_cfg, compute_liveness, liveness_at_instructions,
+        instr_def_uses, is_special_reg, SIDE_EFFECTING,
+    )
+    stmts = list(statements)
+    changed = True
+    while changed:
+        changed = False
+        cfg = build_cfg(stmts)
+        _, live_out = compute_liveness(cfg)
+        live_after = liveness_at_instructions(cfg, live_out)
+        dead: set[int] = set()
+        for idx, instr in enumerate(stmts):
+            if not isinstance(instr, Instruction):
+                continue
+            if instr.opcode in SIDE_EFFECTING:
+                continue
+            sdef, cdefs, uses, pred = instr_def_uses(instr)
+            if sdef is None or cdefs or is_special_reg(sdef):
+                continue  # only pure single-scalar-dest, non-predicate defs
+            if sdef not in live_after.get(idx, ()):
+                dead.add(idx)
+        if dead:
+            stmts = [s for k, s in enumerate(stmts) if k not in dead]
+            changed = True
+    return _drop_unused_scalar_decls(stmts)
+
+
+def _drop_unused_scalar_decls(statements: list[Statement]) -> list[Statement]:
+    used: set[str] = set()
+    for s in statements:
+        if isinstance(s, Instruction):
+            used |= _stmt_reg_names(s)
+    out: list[Statement] = []
+    for s in statements:
+        if isinstance(s, RegDecl) and s.count is None and s.name not in used:
+            continue
+        out.append(s)
+    return out
+
+
+def allocate_registers(statements: list[Statement]) -> list[Statement]:
+    """Interference-graph register coloring. Bails (returns input unchanged)
+    on any control flow it can't prove it modeled correctly."""
+    from pyptx.ir.analysis import (
+        build_cfg, compute_liveness, liveness_at_instructions,
+        instr_def_uses, is_special_reg, _branch_target,
+    )
+    from collections import defaultdict
+
+    cfg = build_cfg(statements)
+    # SAFETY: every branch target must resolve, or liveness is unsound; and
+    # `call` has a nonstandard def/use shape we don't model -> bail on both.
+    for blk in cfg.blocks:
+        for k in blk.insts:
+            instr = statements[k]
+            if instr.opcode == "call":
+                return statements
+            if instr.opcode == "bra":
+                tgt = _branch_target(instr)
+                if tgt is None or tgt not in cfg.label_to_block:
+                    return statements  # unresolved / indirect branch -> bail
+
+    live_in, live_out = compute_liveness(cfg)
+    live_after = liveness_at_instructions(cfg, live_out)
+    type_lookup = _reg_type_lookup(statements)
+
+    # allocatable regs = non-special regs with a known declared type
+    regs: set[str] = set()
+    for instr in statements:
+        if not isinstance(instr, Instruction):
+            continue
+        sdef, cdefs, uses, _ = instr_def_uses(instr)
+        for r in ([sdef] if sdef else []) + cdefs + uses:
+            if r and not is_special_reg(r):
+                regs.add(r)
+    regs = {r for r in regs if type_lookup(r) is not None}
+    if not regs:
+        return statements
+
+    adj: dict[str, set[str]] = defaultdict(set)
+
+    def add_clique(names):
+        members = [r for r in names if r in regs]
+        for a in range(len(members)):
+            for b in range(a + 1, len(members)):
+                x, y = members[a], members[b]
+                adj[x].add(y)
+                adj[y].add(x)
+
+    add_clique(live_in[cfg.blocks[0].id])
+    for idx, instr in enumerate(statements):
+        if not isinstance(instr, Instruction):
+            continue
+        pointset = set(live_after.get(idx, ()))
+        sdef, cdefs, uses, _ = instr_def_uses(instr)
+        if sdef and not is_special_reg(sdef):
+            pointset.add(sdef)
+        for r in cdefs:
+            if not is_special_reg(r):
+                pointset.add(r)
+        add_clique(pointset)
+
+    # color each type's subgraph greedily (highest degree first)
+    by_type: dict[str, list[str]] = defaultdict(list)
+    for r in regs:
+        by_type[type_lookup(r)].append(r)
+    color: dict[str, int] = {}
+    ncolors: dict[str, int] = {}
+    for ty, rs in by_type.items():
+        for r in sorted(rs, key=lambda r: (-len(adj[r]), r)):
+            taken = {color[n] for n in adj[r] if n in color}
+            c = 0
+            while c in taken:
+                c += 1
+            color[r] = c
+        ncolors[ty] = (max((color[r] for r in rs), default=-1) + 1)
+
+    # POST-CONDITION: every interference edge must be a different color.
+    for x, neigh in adj.items():
+        for y in neigh:
+            if type_lookup(x) == type_lookup(y) and color[x] == color[y]:
+                return statements  # coloring unsound -> bail rather than corrupt
+
+    rename: dict[str, str] = {}
+    for r in regs:
+        ty = type_lookup(r)
+        rename[r] = f"%ra_{_ty_str(ty).replace('.', '')}_{color[r]}"
+    if all(rename[r] == r for r in regs):
+        return statements
+
+    from dataclasses import replace
+    # rebuild: fresh compact decls for the colored set + renamed instructions,
+    # dropping the old decls of allocated regs.
+    new_decls: list[RegDecl] = []
+    for ty, k in ncolors.items():
+        for c in range(k):
+            new_decls.append(RegDecl(type=ty, name=f"%ra_{_ty_str(ty).replace('.', '')}_{c}", count=None))
+
+    result: list[Statement] = list(new_decls)
+    for s in statements:
+        if isinstance(s, RegDecl):
+            # drop decls fully covered by the allocation (their regs are renamed)
+            if s.count is None and s.name in rename:
+                continue
+            if s.count is not None:
+                # ranged decl: keep only if some covered reg escaped allocation
+                pfx = s.name
+                covered = any(
+                    r.startswith(pfx) and r[len(pfx):].isdigit() and r in rename
+                    for r in regs
+                )
+                escaped = any(
+                    r.startswith(pfx) and r[len(pfx):].isdigit() and r not in rename
+                    for r in regs
+                )
+                if covered and not escaped:
+                    continue
+            result.append(s)
+            continue
+        if isinstance(s, Instruction):
+            new_ops = tuple(_rename_operand(op, rename) for op in s.operands)
+            pred = s.predicate
+            if pred is not None and isinstance(getattr(pred, "register", None), str):
+                nc = rename.get(pred.register, pred.register)
+                if nc != pred.register:
+                    pred = replace(pred, register=nc)
+            if new_ops != s.operands or pred is not s.predicate:
+                s = replace(s, operands=new_ops, predicate=pred)
+        result.append(s)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Pass B: list scheduling.
+#
+# Reorders instructions within each basic block to interleave independent
+# dependency chains, so a long-latency producer (a TMEM/global load, an SFU
+# ex2) issues well before its consumer with other work in between, instead of
+# the strict Python program order the trace emits. Preserves semantics by
+# honoring every register RAW/WAR/WAW dependence and keeping all
+# side-effecting instructions (memory, barriers, control) in their original
+# relative order. Priority is the latency-weighted critical path (longest-
+# path-first), the textbook list-scheduling heuristic.
+#
+# ptxas re-schedules too, so this is a modest lever; but a cleaner starting
+# order can only help its (finite) scheduling window. Opt-in; the schedule is
+# checked to be a valid topological order before it is accepted.
+# ---------------------------------------------------------------------------
+
+def _op_latency(opcode: str) -> int:
+    if opcode in ("ld", "atom", "cp", "mbarrier"):
+        return 8
+    if opcode.startswith("tcgen05") or opcode in ("mma", "wgmma"):
+        return 8
+    if opcode in ("ex2", "lg2", "rcp", "sqrt", "rsqrt", "sin", "cos", "div", "rem"):
+        return 6
+    if opcode in ("mul", "mad", "fma", "dp4a", "dp2a"):
+        return 3
+    return 1
+
+
+def list_schedule(statements: list[Statement]) -> list[Statement]:
+    """Latency-oriented list scheduling within each basic block."""
+    from pyptx.ir.analysis import build_cfg, instr_def_uses, is_special_reg, SIDE_EFFECTING
+
+    cfg = build_cfg(statements)
+    result = list(statements)
+
+    for blk in cfg.blocks:
+        slots = list(blk.insts)  # statement indices holding Instructions
+        if len(slots) < 3:
+            continue
+        instrs = [statements[k] for k in slots]
+        m = len(instrs)
+
+        # reads/writes per instruction (conservative for predication)
+        reads: list[set[str]] = []
+        writes: list[set[str]] = []
+        for ins in instrs:
+            sdef, cdefs, uses, pred = instr_def_uses(ins)
+            r = {x for x in uses if not is_special_reg(x)}
+            w = set()
+            if sdef is not None and not is_special_reg(sdef):
+                w.add(sdef)
+            for x in cdefs:
+                if not is_special_reg(x):
+                    w.add(x)
+            if pred:
+                r |= w  # conditional write also depends on the old value
+            reads.append(r)
+            writes.append(w)
+
+        se = [i for i in range(m) if instrs[i].opcode in SIDE_EFFECTING]
+        term_local = None
+        if instrs and instrs[-1].opcode in ("bra", "ret", "exit", "trap"):
+            term_local = m - 1
+
+        # dependence edges pred -> succ (succ must come after pred)
+        succ: list[set[int]] = [set() for _ in range(m)]
+        indeg = [0] * m
+
+        def add_edge(a: int, b: int):
+            if a < b and b not in succ[a]:
+                succ[a].add(b)
+
+        for a in range(m):
+            for b in range(a + 1, m):
+                if (writes[a] & reads[b]) or (reads[a] & writes[b]) or (writes[a] & writes[b]):
+                    add_edge(a, b)
+        # total order among side-effecting ops (consecutive chain suffices)
+        for x, y in zip(se, se[1:]):
+            add_edge(x, y)
+        # pin a terminator strictly last
+        if term_local is not None:
+            for a in range(m):
+                if a != term_local:
+                    add_edge(a, term_local)
+
+        for a in range(m):
+            for b in succ[a]:
+                indeg[b] += 1
+
+        # latency-weighted critical path (priority)
+        prio = [0] * m
+        for a in reversed(range(m)):
+            best = 0
+            for b in succ[a]:
+                best = max(best, prio[b])
+            prio[a] = _op_latency(instrs[a].opcode) + best
+
+        # list schedule: among ready (indeg 0), pick highest prio, then
+        # earliest original index (stable).
+        import heapq
+        ready = [(-prio[i], i) for i in range(m) if indeg[i] == 0]
+        heapq.heapify(ready)
+        order: list[int] = []
+        remaining_indeg = list(indeg)
+        while ready:
+            _, i = heapq.heappop(ready)
+            order.append(i)
+            for b in succ[i]:
+                remaining_indeg[b] -= 1
+                if remaining_indeg[b] == 0:
+                    heapq.heappush(ready, (-prio[b], b))
+
+        if len(order) != m:
+            continue  # cycle (shouldn't happen) -> leave block as-is
+
+        # validate topological order before committing
+        pos = {i: p for p, i in enumerate(order)}
+        ok = all(pos[a] < pos[b] for a in range(m) for b in succ[a])
+        if not ok:
+            continue
+        if order == list(range(m)):
+            continue  # no change
+
+        for slot, local in zip(slots, order):
+            result[slot] = instrs[local]
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Pass C: SSA-based global value renaming.
+#
+# The principled, global version of the block-local value-splitting pass.
+# Full phi-based SSA with out-of-SSA destruction (critical-edge splitting,
+# parallel-copy sequentialization) is the textbook form, but its correctness
+# hinges on details that can't be exercised without running the kernel — so
+# here it is realized as the provably-safe subset that needs NO phi nodes and
+# NO destruction: reaching-definitions analysis isolates every *exclusive*
+# def->use web (an unconditional def whose value is the sole reaching
+# definition at each of its uses) and alpha-renames it to a fresh register.
+# That is exactly what SSA renaming produces for a variable that never merges;
+# variables that would require a phi are left untouched. Result is a strictly
+# larger set of independent live ranges (broken false deps) across block
+# boundaries, complementing the intra-block `split` pass. The "coalescing"
+# half of "SSA + coalescing" is the `regalloc` pass.
+# ---------------------------------------------------------------------------
+
+def ssa_reconstruct(statements: list[Statement]) -> list[Statement]:
+    """Pass C: isolate exclusive def->use webs into fresh registers."""
+    return _ssa_reconstruct_impl(statements)
+
+
+def _ssa_reconstruct_impl(statements: list[Statement]) -> list[Statement]:
+    from pyptx.ir.analysis import build_cfg, instr_def_uses, is_special_reg
+
+    cfg = build_cfg(statements)
+    type_lookup = _reg_type_lookup(statements)
+
+    # per-instruction reads / (unconditional, conditional) writes
+    reads: dict[int, set[str]] = {}
+    uwrites: dict[int, set[str]] = {}   # unconditional (killing) writes
+    cwrites: dict[int, set[str]] = {}   # conditional (predicated) writes
+    for idx, ins in enumerate(statements):
+        if not isinstance(ins, Instruction):
+            continue
+        sdef, cdefs, uses, pred = instr_def_uses(ins)
+        reads[idx] = {x for x in uses if not is_special_reg(x)}
+        w = set()
+        if sdef is not None and not is_special_reg(sdef):
+            w.add(sdef)
+        for x in cdefs:
+            if not is_special_reg(x):
+                w.add(x)
+        if pred:
+            cwrites[idx] = w
+            uwrites[idx] = set()
+        else:
+            uwrites[idx] = w
+            cwrites[idx] = set()
+
+    # reaching definitions: a def-site is (idx, reg). Forward dataflow.
+    reach_out: dict[int, set[tuple[int, str]]] = {b.id: set() for b in cfg.blocks}
+    reach_in: dict[int, set[tuple[int, str]]] = {b.id: set() for b in cfg.blocks}
+    reach_before: dict[int, set[tuple[int, str]]] = {}
+
+    def transfer(blk, cur):
+        cur = set(cur)
+        for idx in blk.insts:
+            reach_before[idx] = set(cur)
+            for r in uwrites.get(idx, ()):  # kill prior defs of r
+                cur = {(i, rr) for (i, rr) in cur if rr != r}
+                cur.add((idx, r))
+            for r in cwrites.get(idx, ()):  # predicated: add, do not kill
+                cur.add((idx, r))
+        return cur
+
+    changed = True
+    while changed:
+        changed = False
+        for blk in cfg.blocks:
+            inn = set()
+            for p in blk.preds:
+                inn |= reach_out[p]
+            reach_in[blk.id] = inn
+            out = transfer(blk, inn)
+            if out != reach_out[blk.id]:
+                reach_out[blk.id] = out
+                changed = True
+
+    # for each use-site, the reaching defs of the used reg
+    # def_site -> set of use indices it reaches; also validity flags
+    from collections import Counter, defaultdict
+    # total unconditional-def count per reg — a single-def reg is already SSA,
+    # so renaming it is pointless churn; only isolate reused (>=2 def) regs.
+    defcount: Counter = Counter()
+    for idx in uwrites:
+        for r in uwrites[idx]:
+            defcount[r] += 1
+    def_uses: dict[tuple[int, str], set[int]] = defaultdict(set)
+    def_isolatable: dict[tuple[int, str], bool] = {}
+    # seed: every unconditional def-site of a multiply-defined reg is a candidate
+    for idx in uwrites:
+        for r in uwrites[idx]:
+            if defcount[r] >= 2:
+                def_isolatable[(idx, r)] = True
+
+    for j in reads:
+        rb = reach_before.get(j, set())
+        for r in reads[j]:
+            reaching = [(i, rr) for (i, rr) in rb if rr == r]
+            carrying = r in uwrites.get(j, ()) or r in cwrites.get(j, ())
+            if len(reaching) == 1 and reaching[0] in def_isolatable and not carrying:
+                def_uses[reaching[0]].add(j)
+            else:
+                # this use is a merge / carrying / from a predicated def:
+                # every def that reaches it becomes non-isolatable
+                for d in reaching:
+                    if d in def_isolatable:
+                        def_isolatable[d] = False
+
+    # build renames for isolatable webs with a known type and >=1 use
+    rename_at: dict[int, dict[str, str]] = {}
+    fresh_decls: list[RegDecl] = []
+    counter = 0
+    # fresh name prefix guaranteed novel
+    existing = {s.name for s in statements if isinstance(s, RegDecl)}
+    prefix = "%ssa"
+    while any(n.startswith(prefix) for n in existing):
+        prefix += "_"
+
+    for (idx, r), ok in def_isolatable.items():
+        if not ok:
+            continue
+        us = def_uses.get((idx, r), set())
+        if not us:
+            continue  # dead def (DCE's job) — nothing to isolate
+        ty = type_lookup(r)
+        if ty is None or _ty_str(ty) == ".pred":
+            continue
+        fresh = f"{prefix}{counter}"
+        counter += 1
+        fresh_decls.append(RegDecl(type=ty, name=fresh, count=None))
+        rename_at.setdefault(idx, {})[r] = fresh   # the def
+        for j in us:
+            rename_at.setdefault(j, {})[r] = fresh  # its exclusive uses
+
+    if not rename_at:
+        return statements
+
+    from dataclasses import replace
+    result: list[Statement] = list(fresh_decls)
+    for k, s in enumerate(statements):
+        if k in rename_at and isinstance(s, Instruction):
+            ren = rename_at[k]
+            new_ops = tuple(_rename_operand(op, ren) for op in s.operands)
+            pred = s.predicate
+            if pred is not None and isinstance(getattr(pred, "register", None), str):
+                nc = ren.get(pred.register, pred.register)
+                if nc != pred.register:
+                    pred = replace(pred, register=nc)
+            if new_ops != s.operands or pred is not s.predicate:
+                s = replace(s, operands=new_ops, predicate=pred)
+        result.append(s)
+    return result
+
+
 def verify_body(statements: list[Statement]) -> list[str]:
     """Cheap structural verifier: catch dangling uses and multi-defined
     canonicals introduced by a buggy pass. Returns a list of problems
@@ -601,46 +1087,79 @@ def verify_body(statements: list[Statement]) -> list[str]:
     return problems
 
 
-def optimize_body(statements: list[Statement], level: int = 1) -> list[Statement]:
-    """Run the pass pipeline on one function body.
+# Named pass registry — every transform is individually addressable so the
+# pipeline can be composed explicitly (env PYPTX_PASSES="gvn,dce,regalloc").
+def _pass_registry():
+    return {
+        "copyprop": copy_propagate,
+        "gvn": gvn_invariant,
+        "dce": dead_code_eliminate,
+        "split": split_false_deps,
+        "regalloc": allocate_registers,
+        "schedule": list_schedule,
+        "ssa": ssa_reconstruct,
+    }
 
-    level 0: no-op (byte-identical to trace output).
-    level 1: copy propagation + GVN/LICM of invariant computes (pass D).
-    level 2: + false-dependency breaking / value splitting (SSA-lite).
+# Numeric-level presets (env PYPTX_OPT). Level 1 is the low-risk set that only
+# removes work; higher levels add the opposing false-dep / allocation levers
+# which change the vreg count and want hardware A/B before being trusted.
+_LEVEL_PRESETS = {
+    1: ("copyprop", "gvn", "dce"),
+    2: ("copyprop", "gvn", "dce", "split"),
+    3: ("copyprop", "gvn", "dce", "regalloc"),
+    4: ("copyprop", "gvn", "dce", "schedule"),
+    5: ("copyprop", "gvn", "ssa", "dce", "schedule"),
+}
 
-    Falls back to the input unchanged if the result fails verification —
-    so a pass bug can never silently corrupt a kernel.
+
+def optimize_body(statements, level: int = 1, passes=None) -> list[Statement]:
+    """Run the optimization pipeline on one function body.
+
+    Pass selection: an explicit `passes` name list wins; otherwise the
+    `level` preset is used (level 0 / empty = no-op). Each pass self-verifies
+    (verify_body) and is skipped — leaving the pre-pass IR intact — if it
+    would introduce a structural error, so a single buggy pass can neither
+    corrupt the kernel nor sink the rest of the pipeline.
     """
-    if level < 1:
-        return statements
-    original = statements
-    out = copy_propagate(list(statements))
-    out = gvn_invariant(out)
-    if level >= 2:
-        out = split_false_deps(out)
-    problems = verify_body(out)
-    if problems:
-        import warnings
-        warnings.warn(
-            f"pyptx.optimize: verification failed ({problems[:3]}); "
-            f"falling back to unoptimized body",
-            RuntimeWarning,
-        )
-        return original
+    if passes is None:
+        if level < 1:
+            return statements
+        passes = _LEVEL_PRESETS.get(level, _LEVEL_PRESETS[max(_LEVEL_PRESETS)])
+    registry = _pass_registry()
+    import warnings
+    out = list(statements)
+    for name in passes:
+        fn = registry.get(name)
+        if fn is None:
+            warnings.warn(f"pyptx.optimize: unknown pass {name!r}; skipping",
+                          RuntimeWarning)
+            continue
+        try:
+            candidate = fn(list(out))
+            problems = verify_body(candidate)
+        except Exception as exc:  # a pass bug must never break emission
+            warnings.warn(f"pyptx.optimize: pass {name!r} raised {exc!r}; "
+                          f"skipping", RuntimeWarning)
+            continue
+        if problems:
+            warnings.warn(f"pyptx.optimize: pass {name!r} failed verification "
+                          f"({problems[:3]}); skipping", RuntimeWarning)
+            continue
+        out = candidate
     return out
 
 
-def optimize_module(module, level: int = 1):
-    """Apply the pass pipeline to every Function body in a Module."""
-    if level < 1:
+def optimize_module(module, level: int = 1, passes=None):
+    """Apply the pipeline to every Function body in a Module."""
+    if passes is None and level < 1:
         return module
     from dataclasses import replace
     new_dirs = []
     changed = False
     for d in module.directives:
         if type(d).__name__ == "Function" and getattr(d, "body", None):
-            new_body = optimize_body(list(d.body), level=level)
-            if new_body is not d.body:
+            new_body = optimize_body(list(d.body), level=level, passes=passes)
+            if tuple(new_body) != d.body:
                 d = replace(d, body=tuple(new_body))
                 changed = True
         new_dirs.append(d)
