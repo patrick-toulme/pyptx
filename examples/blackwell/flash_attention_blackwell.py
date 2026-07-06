@@ -152,6 +152,9 @@ def build_flash_attention_blackwell(
     dbg_f16_noexp: bool = False,
     waitmap: bool = False,
     num_sms: int = 148,
+    dbg_scoreboard_ld: bool = True,   # drop explicit tcgen05.wait_ld in the
+                                      # softmax stream, rely on the register
+                                      # scoreboard (FA4 emits 0 wait::ld)
     # Work items overlap freely across all roles, with ONE cross-item
     # gate: the softmax pool's item start waits for the previous
     # epilogue's O readout (BAR_EPI). Without it, the softmax warps'
@@ -878,12 +881,22 @@ def build_flash_attention_blackwell(
 
                 # ---- stream 4 chunks: ld(c+1) flies under exp/store(c) --
                 for c in range(4):
-                    ptx.tcgen05.wait_ld()
-                    if c < 3:
-                        an = reg.scalar(b32)
-                        ptx.inst.add.u32(an, sp_base, (c + 1) * 32)
-                        ptx.tcgen05.ld(bufs[(c + 1) & 1], an,
-                                       shape="32x32b", count=32, dtype="b32")
+                    if dbg_scoreboard_ld:
+                        # issue next load, then consume current; the
+                        # register scoreboard stalls exp only for ld(c)'s
+                        # own registers (FA4 emits no explicit wait::ld)
+                        if c < 3:
+                            an = reg.scalar(b32)
+                            ptx.inst.add.u32(an, sp_base, (c + 1) * 32)
+                            ptx.tcgen05.ld(bufs[(c + 1) & 1], an,
+                                           shape="32x32b", count=32, dtype="b32")
+                    else:
+                        ptx.tcgen05.wait_ld()
+                        if c < 3:
+                            an = reg.scalar(b32)
+                            ptx.inst.add.u32(an, sp_base, (c + 1) * 32)
+                            ptx.tcgen05.ld(bufs[(c + 1) & 1], an,
+                                           shape="32x32b", count=32, dtype="b32")
                     v = bufs[c & 1]
                     exp_chunk(v)
                     for k in range(16):
