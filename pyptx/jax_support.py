@@ -344,7 +344,12 @@ def compile_ptx_to_cubin(
             kernel_name = _extract_entry_name(ptx_source)
 
         err, module = driver.cuModuleLoadData(ptx_source.encode())
-        if err == driver.CUresult.CUDA_ERROR_UNSUPPORTED_PTX_VERSION:
+        # The driver's built-in JIT ptxas can lag the installed CUDA
+        # toolkit's ptxas and reject PTX the toolkit accepts (seen as
+        # INVALID_PTX as well as UNSUPPORTED_PTX_VERSION). Fall back to
+        # the toolkit ptxas -> cubin path in both cases.
+        if err in (driver.CUresult.CUDA_ERROR_UNSUPPORTED_PTX_VERSION,
+                   driver.CUresult.CUDA_ERROR_INVALID_PTX):
             fn, module = _compile_ptx_via_ptxas(
                 ptx_source=ptx_source,
                 arch=arch,

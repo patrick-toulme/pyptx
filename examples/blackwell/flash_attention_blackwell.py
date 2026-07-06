@@ -297,9 +297,10 @@ def build_flash_attention_blackwell(
             ptx.mbarrier.init(base + BAR_Q_FREE, 1)
             if dbg_lockstep:
                 ptx.mbarrier.init(base + BAR_ITER, lock_count)
-            if dbg_epi_gate:
-                # arrived by the 128 correction threads per epilogue
-                ptx.mbarrier.init(base + BAR_EPI, 128)
+            # folded epilogue: all 256 softmax threads arrive EPI after
+            # their O readout and wait it at the next item's start (the
+            # TMEM store-vs-readout hazard spans both stages)
+            ptx.mbarrier.init(base + BAR_EPI, 256)
             ptx.fence.proxy_async_shared_cta()
         with ptx.if_(alloc_warp):
             ptx.tcgen05.alloc(base + SMEM_TMEM_SLOT, 512)
@@ -639,6 +640,17 @@ def build_flash_attention_blackwell(
             ptx.inst.add.u32(sp_base, sp_base, lane_addr_bits)
             ptx.inst.add.u32(sp_base, sp_base, st_col)
 
+            # O TMEM base for this thread's row (folded epilogue/rescale):
+            # TM_O[0]=256, TM_O[1]=384, so O_col = 256 + stage*128
+            o_base = reg.scalar(b32)
+            ptx.inst.mov.b32(o_base, tmem)
+            ptx.inst.add.u32(o_base, o_base, lane_addr_bits)
+            with ptx.scope():
+                oc = reg.scalar(u32)
+                ptx.inst.shl.b32(oc, stage_b, 7)
+                ptx.inst.add.u32(oc, oc, TM_O[0])
+                ptx.inst.add.u32(o_base, o_base, oc)
+
             st8 = reg.scalar(u32)
             ptx.inst.shl.b32(st8, stage_b, 3)             # 8*stage
             sfull_ad = reg.scalar(u32)
@@ -655,6 +667,8 @@ def build_flash_attention_blackwell(
                 st16 = reg.scalar(u32)
                 ptx.inst.shl.b32(st16, stage_b, 4)
                 ptx.inst.add.u32(oresc_ad, st16, base + BAR_O_RESC)
+            pvd_ad = reg.scalar(u32)          # this stage's PV_DONE barrier
+            ptx.inst.add.u32(pvd_ad, st8, base + BAR_PV_DONE)
             stats_bar = reg.scalar(u32)          # named bar 1+w (s0) / 5+w (s1)
             with ptx.scope():
                 st4 = reg.scalar(u32)
@@ -752,7 +766,12 @@ def build_flash_attention_blackwell(
                     else:
                         ptx.inst.add.f32(sacc[a], sacc[a], s)
 
-            def body(is_first: bool, po=None):
+            ph_pv_sm = [reg.scalar(b32, init=0) for _ in range(Q_STAGE)]
+            orv = reg.array(f32, 32)   # O rescale/read buffer (reuses budget)
+
+            def body(is_first: bool, po=None, pv_par=0):
+                alpha_r = reg.scalar(f32)
+                needs_r = reg.scalar(pred)
                 ptx.mbarrier.wait(sfull_ad, ph_s)
                 ptx.inst.xor.b32(ph_s, ph_s, 1)
                 ptx.tcgen05.fence_after_thread_sync()
@@ -770,38 +789,20 @@ def build_flash_attention_blackwell(
 
                 if not is_first:
                     # ---- deferred tail of tile k-1: basis decision from
-                    # this thread's own row max (no exchange) ----
-                    alpha = reg.scalar(f32)
-                    ptx.inst.mov.f32(alpha, one_f)
+                    # this thread's own row max. mneg/l_run must update
+                    # BEFORE this tile's exp; the O rescale (which reuses
+                    # the exp buffers) is deferred to after the P store. --
+                    ptx.inst.mov.f32(alpha_r, one_f)
                     move = reg.scalar(pred)
                     ptx.inst.setp.gt.f32(move, pmax_pend, thresh_p)
                     with ptx.if_(move):
-                        ptx.inst.rcp.approx.f32(alpha, pmax_pend)
+                        ptx.inst.rcp.approx.f32(alpha_r, pmax_pend)
                         lgp = reg.scalar(f32)
                         ptx.inst.lg2.approx.f32(lgp, pmax_pend)
                         ptx.inst.sub.f32(mneg, mneg, lgp)
                     ptx.inst.add.f32(l_run, l_run, sums_pend)
-                    ptx.inst.mul.f32(l_run, l_run, alpha)
-
-                    # publish alpha_{k-1}: gates PV(k) at parity k&1. The
-                    # common-case O_RESC release goes first; the stats-slot
-                    # publish (paced by correction) follows.
-                    needs = reg.scalar(pred)
-                    ptx.inst.setp.lt.f32(needs, alpha, one_f)
-                    blt = reg.scalar(b32)
-                    ptx.inst.vote.sync.ballot.b32(blt, needs, 0xFFFFFFFF)
-                    all_skip = reg.scalar(pred)
-                    ptx.inst.setp.eq.b32(all_skip, blt, 0)
-                    ora = reg.scalar(u32)
-                    if po is None:
-                        ptx.inst.add.u32(ora, oresc_ad, 8)
-                    else:
-                        ptx.inst.add.u32(ora, oresc_ad, po)
-                    ptx.mbarrier.arrive(ora, pred=all_skip)
-                    ptx.mbarrier.wait(sfree_ad, ph_stats)
-                    ptx.inst.xor.b32(ph_stats, ph_stats, 1)
-                    ptx.inst.st.shared.b32(ptx.addr(alpha_ad), alpha)
-                    ptx.inst.bar.arrive(stats_bar, 64)
+                    ptx.inst.mul.f32(l_run, l_run, alpha_r)
+                    ptx.inst.setp.lt.f32(needs_r, alpha_r, one_f)
 
                 if emu_pairs:
                     ptx.inst.mov.b64(m2, [mneg, mneg])
@@ -921,6 +922,43 @@ def build_flash_attention_blackwell(
                 ptx.inst.add.f32(sacc[2], sacc[2], sacc[3])
                 ptx.inst.add.f32(sums_pend, sacc[0], sacc[2])
 
+                # ---- FOLDED O rescale for tile k-1 (bufs are free now) --
+                # gates PV(k) at parity po. Wait this stage's PV(k-1) done
+                # EVERY tile (phase-consistent, cheap when already satisfied
+                # since PV(k-1) ran while we produced P(k)); rescale only
+                # when some row moved basis (rare). Threads with alpha_r==1
+                # multiply O by 1.0 (harmless no-op), so the branch is
+                # warp-uniform on the ballot.
+                if not is_first:
+                    ora = reg.scalar(u32)
+                    if po is None:
+                        ptx.inst.add.u32(ora, oresc_ad, 8)
+                    else:
+                        ptx.inst.add.u32(ora, oresc_ad, po)
+                    blt = reg.scalar(b32)
+                    ptx.inst.vote.sync.ballot.b32(blt, needs_r, 0xFFFFFFFF)
+                    all_skip = reg.scalar(pred)
+                    ptx.inst.setp.eq.b32(all_skip, blt, 0)
+                    any_need = reg.scalar(pred)
+                    ptx.inst.setp.ne.b32(any_need, blt, 0)
+                    ptx.mbarrier.wait(pvd_ad, ph_pv_sm[0])
+                    ptx.inst.xor.b32(ph_pv_sm[0], ph_pv_sm[0], 1)
+                    with ptx.if_(any_need):
+                        ptx.tcgen05.fence_after_thread_sync()
+                        for quarter in range(4):
+                            oa = reg.scalar(b32)
+                            ptx.inst.add.u32(oa, o_base, quarter * 32)
+                            ptx.tcgen05.ld(orv, oa, shape="32x32b", count=32, dtype="b32")
+                            ptx.tcgen05.wait_ld()
+                            for i in range(32):
+                                ptx.inst.mul.f32(orv[i], orv[i], alpha_r)
+                            ptx.tcgen05.st(oa, orv, shape="32x32b", count=32, dtype="b32")
+                        ptx.tcgen05.wait_st()
+                        ptx.tcgen05.fence_before_thread_sync()
+                    # softmax now owns the rescale, so it ALWAYS releases
+                    # O_RESC (unconditionally, whether or not it rescaled)
+                    ptx.mbarrier.arrive(ora)
+
             if emu_pairs:
                 m2 = reg.scalar(b64)
 
@@ -929,12 +967,17 @@ def build_flash_attention_blackwell(
             sw = reg.scalar(u32); ptx.inst.mov.u32(sw, cta_id)
             sgo = reg.scalar(pred)
             ptx.inst.setp.lt.u32(sgo, sw, total_work)
-            if dbg_epi_gate == "softmax":
-                epi_ph = reg.scalar(b32, init=0)
+            epi_ph = reg.scalar(b32, init=0)
+            (po_g,) = ptx.global_ptrs(O)
+            done_ph = reg.scalar(b32, init=0)
+            # pre-arm: EPI so the first item's start-gate passes, and this
+            # stage's PV(0) O_RESC (parity 0) so the first PV proceeds
+            ptx.mbarrier.arrive(base + BAR_EPI)
+            ptx.mbarrier.arrive(oresc_ad)
             with ptx.loop("softmax_work_loop", pred=sgo):
-                if dbg_epi_gate == "softmax":
-                    ptx.mbarrier.wait(base + BAR_EPI, epi_ph)
-                    ptx.inst.xor.b32(epi_ph, epi_ph, 1)
+                # gate the item start on the previous epilogue's O readout
+                ptx.mbarrier.wait(base + BAR_EPI, epi_ph)
+                ptx.inst.xor.b32(epi_ph, epi_ph, 1)
                 ptx.inst.mov.f32(mneg, zero_f)
                 ptx.inst.mov.f32(l_run, zero_f)
                 body(is_first=True)
@@ -949,15 +992,50 @@ def build_flash_attention_blackwell(
                     it += 1
                     ptx.inst.setp.lt.u32(go, it, n_tiles)
 
-                # drain: fold the last tile's sums into l (its basis
-                # decision never runs — the pending rescale cancels between
-                # O and l in the epilogue normalize), publish the row sum,
-                # STATS_FREE-gated like every body publish.
+                # drain the last PV's PV_DONE (no body rescales after it)
+                ptx.mbarrier.wait(pvd_ad, ph_pv_sm[0])
+                ptx.inst.xor.b32(ph_pv_sm[0], ph_pv_sm[0], 1)
+
+                # ---- FOLDED epilogue: this thread owns its row and holds
+                # l in-register (no SMEM round trip). Wait all PV done,
+                # normalize, store bf16, then re-arm the next item. ----
                 ptx.inst.add.f32(l_run, l_run, sums_pend)
-                ptx.inst.st.shared.b32(ptx.addr(sum_ad), l_run)
-                ptx.mbarrier.wait(sfree_ad, ph_stats)
-                ptx.inst.xor.b32(ph_stats, ph_stats, 1)
-                ptx.inst.bar.arrive(stats_bar, 64)
+                inv_l = reg.scalar(f32)
+                ptx.inst.rcp.approx.f32(inv_l, l_run)
+                ptx.mbarrier.wait(base + BAR_O_DONE, done_ph)
+                ptx.inst.xor.b32(done_ph, done_ph, 1)
+                ptx.tcgen05.fence_after_thread_sync()
+
+                q_row0, _ = derive_rows(sw, want_kv=False)
+                orow = reg.scalar(u32)
+                ptx.inst.add.u32(orow, q_row0, row128)
+                with ptx.scope():
+                    srow = reg.scalar(u32)
+                    ptx.inst.shl.b32(srow, stage_b, 7)   # +128 rows for stage 1
+                    ptx.inst.add.u32(orow, orow, srow)
+                gbo = reg.scalar(u64)
+                ptx.inst.mul.wide.u32(gbo, orow, HD * 2)
+                gptr = po_g + gbo
+                oep = reg.array(f32, 32)
+                oepk = reg.array(b32, 16)
+                for quarter in range(4):
+                    oa = reg.scalar(b32)
+                    ptx.inst.add.u32(oa, o_base, quarter * 32)
+                    ptx.tcgen05.ld(oep, oa, shape="32x32b", count=32, dtype="b32")
+                    ptx.tcgen05.wait_ld()
+                    for i in range(32):
+                        ptx.inst.mul.f32(oep[i], oep[i], inv_l)
+                    for c in range(16):
+                        ptx.inst.cvt.rn.bf16x2.f32(oepk[c], oep[2 * c + 1], oep[2 * c])
+                    for vec in range(4):
+                        ptx.inst.st.global_.v4.b32(
+                            ptx.addr(gptr, quarter * 64 + vec * 16),
+                            [oepk[vec * 4 + k] for k in range(4)],
+                        )
+                # O read out: re-arm the softmax item-start gate and the
+                # next item's PV(0) O_RESC (parity 0)
+                ptx.mbarrier.arrive(base + BAR_EPI)
+                ptx.mbarrier.arrive(oresc_ad)
 
                 iter_sync(siter_ph, "softmax")
                 ptx.inst.add.u32(sw, sw, num_ctas)
@@ -966,174 +1044,10 @@ def build_flash_attention_blackwell(
         # =================================================================
         # Correction warps (tids 256-383): O rescale + epilogue
         # =================================================================
+        # Correction warpgroup folded into softmax: these threads only
+        # drop their register budget and idle at the final barrier.
         with ptx.if_(is_correction):
             ptx.setmaxnreg(NREG_CORR, inc=False)
-            from pyptx.types import b16 as _b16c
-            one_f = reg.scalar(f32, init=1.0)
-            stats_bar = [reg.scalar(u32) for _ in range(Q_STAGE)]
-            alpha_addr = [reg.scalar(u32) for _ in range(Q_STAGE)]
-            o_addr = [reg.scalar(b32) for _ in range(Q_STAGE)]
-            for s in range(Q_STAGE):
-                ptx.inst.add.u32(stats_bar[s], warp_in_group, 1 + s * 4)
-                ptx.inst.shl.b32(alpha_addr[s], row128, 2)
-                ptx.inst.add.u32(alpha_addr[s], alpha_addr[s], base + SMEM_STATS + s * 512)
-                ptx.inst.mov.b32(o_addr[s], tmem)
-                ptx.inst.add.u32(o_addr[s], o_addr[s], TM_O[s])
-                ptx.inst.add.u32(o_addr[s], o_addr[s], lane_addr_bits)
-
-            # first KV tile needs no correction: release both stages once
-            # (parity-0 barrier gates PV(0)); also pre-arrive STATS_FREE so
-            # the softmax's pre-write wait at tile 0 is already satisfied
-            for s in range(Q_STAGE):
-                ptx.mbarrier.arrive(base + BAR_O_RESC + 16 * s)
-                ptx.mbarrier.arrive(base + BAR_STATS_FREE + 8 * s)
-            if dbg_epi_gate:
-                ptx.mbarrier.arrive(base + BAR_EPI)
-
-            ovals = reg.array(f32, 64)
-            ph_pv = [reg.scalar(b32, init=0) for _ in range(Q_STAGE)]
-            done_phase = [reg.scalar(b32, init=0) for _ in range(Q_STAGE)]
-            (po,) = ptx.global_ptrs(O)
-            opacked = reg.array(b32, 16)
-
-            citer_ph = reg.scalar(b32, init=0)
-            cw = reg.scalar(u32); ptx.inst.mov.u32(cw, cta_id)
-            cgo = reg.scalar(pred)
-            ptx.inst.setp.lt.u32(cgo, cw, total_work)
-            with ptx.loop("corr_work_loop", pred=cgo):
-              # alpha published at tile i (i = 0..n_tiles-2; the last tile
-              # publishes nothing) rescales O between PV(i) and PV(i+1).
-              # The wait for PV(i)'s completion happens EVERY iteration
-              # (correction idles here anyway) so the phase var tracks the
-              # true completion count — a parity-only wait inside the rare
-              # branch could alias an older same-parity completion and
-              # race the in-flight PV.
-              it = reg.scalar(u32, init=0)
-              go = reg.scalar(pred)
-              ptx.inst.setp.lt.u32(go, it, n_tiles - 1)
-              with ptx.loop("corr_loop", pred=go):
-                ponc = reg.scalar(u32)
-                ptx.inst.add.u32(ponc, it, 1)
-                ptx.inst.and_.b32(ponc, ponc, 1)
-                ptx.inst.shl.b32(ponc, ponc, 3)
-                for stage in range(Q_STAGE):
-                    ptx.bar.sync(stats_bar[stage], 64)
-                    alpha = reg.scalar(f32)
-                    av = smem.load(b32, ptx.addr(alpha_addr[stage]))
-                    ptx.inst.mov.b32(alpha, av)
-                    ptx.mbarrier.arrive(base + BAR_STATS_FREE + 8 * stage)
-                    ptx.mbarrier.wait(base + BAR_PV_DONE + 8 * stage, ph_pv[stage])
-                    ptx.inst.xor.b32(ph_pv[stage], ph_pv[stage], 1)
-                    need = reg.scalar(pred)
-                    ptx.inst.setp.lt.f32(need, alpha, one_f)
-                    ballot = reg.scalar(b32)
-                    ptx.inst.vote.sync.ballot.b32(ballot, need, 0xFFFFFFFF)
-                    any_need = reg.scalar(pred)
-                    ptx.inst.setp.ne.b32(any_need, ballot, 0)
-                    # softmax already released O_RESC when nothing rescales
-                    with ptx.if_(any_need):
-                        ptx.tcgen05.fence_after_thread_sync()
-                        for half in range(2):
-                            addr = reg.scalar(b32)
-                            ptx.inst.add.u32(addr, o_addr[stage], half * 64)
-                            ptx.tcgen05.ld(ovals, addr, shape="32x32b", count=64, dtype="b32")
-                            ptx.tcgen05.wait_ld()
-                            for i in range(64):
-                                ptx.inst.mul.f32(ovals[i], ovals[i], alpha)
-                            ptx.tcgen05.st(addr, ovals, shape="32x32b", count=64, dtype="b32")
-                        ptx.tcgen05.wait_st()
-                        ptx.tcgen05.fence_before_thread_sync()
-                        ora = reg.scalar(u32)
-                        ptx.inst.add.u32(
-                            ora, ponc, base + BAR_O_RESC + 16 * stage
-                        )
-                        ptx.mbarrier.arrive(ora)
-                it += 1
-                ptx.inst.setp.lt.u32(go, it, n_tiles - 1)
-
-              # drain: consume the last tile's PV_DONE completion so the
-              # per-work-item wait/completion counts stay exactly balanced
-              # (unconsumed completions would drift the parity waits)
-              for stage in range(Q_STAGE):
-                  ptx.mbarrier.wait(base + BAR_PV_DONE + 8 * stage, ph_pv[stage])
-                  ptx.inst.xor.b32(ph_pv[stage], ph_pv[stage], 1)
-
-              # arrive the work-item boundary BEFORE the epilogue: the
-              # DRAM-bound O readout then overlaps the next item's QK and
-              # softmax, while the next PV(0) stays gated on the
-              # post-epilogue O_RESC re-arm
-              iter_sync(citer_ph, "corr")
-
-              # ---- epilogue: wait all PV done, normalize, store bf16 ----
-              ptx.mbarrier.wait(base + BAR_O_DONE, done_phase[0])
-              ptx.inst.xor.b32(done_phase[0], done_phase[0], 1)
-              ptx.tcgen05.fence_after_thread_sync()
-
-              q_row0, _ = derive_rows(cw, want_kv=False)
-              out_row = reg.scalar(u32)
-              ptx.inst.add.u32(out_row, q_row0, row128)
-
-              for stage in range(Q_STAGE):
-                ptx.bar.sync(stats_bar[stage], 64)
-                # streaming softmax publishes one full-row sum per row
-                la = smem.load(b32, ptx.addr(alpha_addr[stage] + 1024))
-                l = reg.scalar(f32)
-                ptx.inst.mov.b32(l, la)
-                inv_l = reg.scalar(f32)
-                ptx.inst.rcp.approx.f32(inv_l, l)
-
-                row = reg.scalar(u32)
-                ptx.inst.add.u32(row, out_row, stage * BM)
-                byte_off = reg.scalar(u64)
-                ptx.inst.mul.wide.u32(byte_off, row, HD * 2)
-                gptr = po + byte_off
-                if dbg_f16_noexp:
-                    # debug build: store raw O (no normalization)
-                    ptx.inst.mov.f32(inv_l, reg.scalar(f32, init=1.0))
-
-                for half in range(2):
-                    addr = reg.scalar(b32)
-                    ptx.inst.add.u32(addr, o_addr[stage], half * 64)
-                    ptx.tcgen05.ld(ovals, addr, shape="32x32b", count=64, dtype="b32")
-                    ptx.tcgen05.wait_ld()
-                    if stage == 1 and half == 1:
-                        # the LAST TMEM read is complete: everything the
-                        # gates protect (the readout — TC writes to O or
-                        # softmax TMEM traffic during it corrupt rows) is
-                        # done, and the remaining normalize/pack/store is
-                        # register->global work. Release the next item
-                        # now so it overlaps the store tail.
-                        ptx.mbarrier.arrive(base + BAR_STATS_FREE + 8)
-                        if dbg_epi_gate:
-                            ptx.mbarrier.arrive(base + BAR_EPI)
-                        for s in range(Q_STAGE):
-                            ptx.mbarrier.arrive(base + BAR_O_RESC + 16 * s)
-                    for i in range(64):
-                        ptx.inst.mul.f32(ovals[i], ovals[i], inv_l)
-                    for q in range(2):
-                        if s_f16:
-                            for c in range(16):
-                                ha = reg.scalar(_b16c); hb = reg.scalar(_b16c)
-                                ptx.inst.cvt.rn.f16.f32(ha, ovals[32 * q + 2 * c])
-                                ptx.inst.cvt.rn.f16.f32(hb, ovals[32 * q + 2 * c + 1])
-                                ptx.inst.mov.b32(opacked[c], [ha, hb])
-                        else:
-                            for c in range(16):
-                                ptx.inst.cvt.rn.bf16x2.f32(
-                                    opacked[c],
-                                    ovals[32 * q + 2 * c + 1], ovals[32 * q + 2 * c]
-                                )
-                        for vec in range(4):
-                            ptx.inst.st.global_.v4.b32(
-                                ptx.addr(gptr, half * 128 + q * 64 + vec * 16),
-                                [opacked[vec * 4 + k] for k in range(4)],
-                            )
-                if stage == 0:
-                    # stage-0 sums slot consumed: return the credit
-                    ptx.mbarrier.arrive(base + BAR_STATS_FREE)
-
-              ptx.inst.add.u32(cw, cw, num_ctas)
-              ptx.inst.setp.lt.u32(cgo, cw, total_work)
 
         ptx.bar.sync(0, 512)
         if waitmap:
