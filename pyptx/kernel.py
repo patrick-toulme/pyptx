@@ -808,6 +808,25 @@ class Kernel:
             print(my_kernel.ptx(M=4096, N=4096, K=4096, BM=128))
         """
         module = self._trace(**kwargs)
+        return self._emit_optimized(module)
+
+    def _emit_optimized(self, module) -> str:
+        """Emit PTX, optionally running the IR optimization pipeline.
+
+        Gated by the PYPTX_OPT env var (0=off/byte-identical, 1=GVN+LICM
+        of invariant address arithmetic, 2=+register/scheduling passes).
+        Default off so traced output is unchanged until a level is opted
+        into. The pipeline self-verifies and falls back on any anomaly.
+        """
+        import os
+        level_s = os.environ.get("PYPTX_OPT", "0") or "0"
+        try:
+            level = int(level_s)
+        except ValueError:
+            level = 0
+        if level >= 1:
+            from pyptx.ir.optimize import optimize_module
+            module = optimize_module(module, level=level)
         return emit(module)
 
     def module(self, **kwargs: Any) -> Module:
@@ -1068,7 +1087,7 @@ class Kernel:
             # Pass the shape env so TensorSpec.shape is resolved inside
             # the kernel body (A.shape[1] works at trace time).
             module = self._trace(_shape_env=shape_env, **template_kwargs)
-            ptx_source = emit(module)
+            ptx_source = self._emit_optimized(module)
             grid_tuple = self._resolve_grid(shape_env)
 
             # TMA tensors the body called `.tma_desc()` on, in order.
