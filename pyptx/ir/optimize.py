@@ -44,8 +44,14 @@ def copy_propagate(statements: list[Statement]) -> list[Statement]:
     2. Removes the mov instruction
     3. Removes the .reg declaration for %src if it becomes unused
 
-    This produces PTX identical to writing ``ptx.inst.*(dst, ...)``
-    directly — no extra registers, no extra movs.
+    UNSOUND IN GENERAL — kept only for its narrow single-def use and its unit
+    tests. The backward %src->%dst rename moves %dst's definition earlier; if
+    %dst is a reused (multiply-defined) register that is read between %src's
+    definition and the mov, the rename clobbers that read. Differential
+    validation (pyptx.ir.simulate) catches this on the FA kernel, so this pass
+    is deliberately NOT in the optimization pipeline — gvn + dce achieve the
+    same cleanup soundly. Do not add it back without a liveness-based guard
+    (rename only when %dst is dead at %src's definition point).
     """
     # Find mov.bN %dst, %src where both are named registers
     # These come from RegArray.__setitem__
@@ -982,10 +988,13 @@ def _ssa_reconstruct_impl(statements: list[Statement]) -> list[Statement]:
             defcount[r] += 1
     def_uses: dict[tuple[int, str], set[int]] = defaultdict(set)
     def_isolatable: dict[tuple[int, str], bool] = {}
-    # seed: every unconditional def-site of a multiply-defined reg is a candidate
+    # seed candidates: an unconditional def-site of a reused (>=2 def) reg that
+    # is a KILLING def — it must not read its own register (a carrying def like
+    # `shl r, r, n` reads the *previous* value at the same site, so renaming r
+    # there would corrupt that read).
     for idx in uwrites:
         for r in uwrites[idx]:
-            if defcount[r] >= 2:
+            if defcount[r] >= 2 and r not in reads.get(idx, ()):
                 def_isolatable[(idx, r)] = True
 
     for j in reads:
@@ -1001,6 +1010,28 @@ def _ssa_reconstruct_impl(statements: list[Statement]) -> list[Statement]:
                 for d in reaching:
                     if d in def_isolatable:
                         def_isolatable[d] = False
+
+    # Dominance gate: exclusive reaching-def is NECESSARY but not SUFFICIENT
+    # for phi-free isolation — the def must also DOMINATE every use, or a
+    # loop-carried use across a back-edge would read the fresh register before
+    # it is ever written (used-before-def). Compute the dominator tree and
+    # require def-block dom use-block (and def-before-use within a block).
+    from pyptx.ir.analysis import compute_dominators
+    dom = compute_dominators(cfg)
+    blk_of = [-1] * len(statements)
+    for b in cfg.blocks:
+        for i in range(b.start, b.end):
+            blk_of[i] = b.id
+
+    def _dominates_all(def_idx, uses):
+        db = blk_of[def_idx]
+        for j in uses:
+            ub = blk_of[j]
+            if db not in dom.get(ub, ()):  # def-block must dominate use-block
+                return False
+            if ub == db and j < def_idx:   # same block: def must precede use
+                return False
+        return True
 
     # build renames for isolatable webs with a known type and >=1 use
     rename_at: dict[int, dict[str, str]] = {}
@@ -1018,6 +1049,8 @@ def _ssa_reconstruct_impl(statements: list[Statement]) -> list[Statement]:
         us = def_uses.get((idx, r), set())
         if not us:
             continue  # dead def (DCE's job) — nothing to isolate
+        if not _dominates_all(idx, us):
+            continue  # def doesn't dominate a use -> would orphan it
         ty = type_lookup(r)
         if ty is None or _ty_str(ty) == ".pred":
             continue
@@ -1089,9 +1122,12 @@ def verify_body(statements: list[Statement]) -> list[str]:
 
 # Named pass registry — every transform is individually addressable so the
 # pipeline can be composed explicitly (env PYPTX_PASSES="gvn,dce,regalloc").
+# NOTE: copy_propagate is intentionally absent — its backward src->dst rename
+# is unsound when the destination is a reused (multiply-defined) register, and
+# differential validation (pyptx.ir.simulate) flags it on the FA kernel. Its
+# intended cleanup (RegArray.__setitem__ movs) is subsumed by gvn + dce.
 def _pass_registry():
     return {
-        "copyprop": copy_propagate,
         "gvn": gvn_invariant,
         "dce": dead_code_eliminate,
         "split": split_false_deps,
@@ -1104,11 +1140,11 @@ def _pass_registry():
 # removes work; higher levels add the opposing false-dep / allocation levers
 # which change the vreg count and want hardware A/B before being trusted.
 _LEVEL_PRESETS = {
-    1: ("copyprop", "gvn", "dce"),
-    2: ("copyprop", "gvn", "dce", "split"),
-    3: ("copyprop", "gvn", "dce", "regalloc"),
-    4: ("copyprop", "gvn", "dce", "schedule"),
-    5: ("copyprop", "gvn", "ssa", "dce", "schedule"),
+    1: ("gvn", "dce"),
+    2: ("gvn", "dce", "split"),
+    3: ("gvn", "dce", "regalloc"),
+    4: ("gvn", "dce", "schedule"),
+    5: ("gvn", "ssa", "dce", "schedule"),
 }
 
 
