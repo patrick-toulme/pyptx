@@ -2524,33 +2524,42 @@ def build_flash_attention_blackwell_occ2(
                     ptx.inst.st.shared.b32(ptx.addr(alpha_addr), alpha)
                     ptx.mbarrier.arrive(base + O2B_STATS_FULL)
 
-                # ---- single exp pass over four 32-column quarters; stale
-                # basis (mneg), so no max pass in front. Store P over S,
-                # accumulate running max (for the deferred drift check) and
-                # sum on the exp'd values ----
-                for q in range(4):
-                    ld_quarter(q)
-                    for i in range(32):
-                        ptx.inst.fma.rn.f32(vals[i], vals[i], qk_scale_reg, mneg)
-                        ptx.inst.ex2.approx.ftz.f32(vals[i], vals[i])
-                    for c in range(16):
-                        ptx.inst.cvt.rn.bf16x2.f32(
-                            packed[c], vals[2 * c + 1], vals[2 * c]
-                        )
+                # ---- single exp pass, streamed as eight 16-column chunks
+                # ping-ponged between the two halves of `vals` so ld(c+1)
+                # flies under exp/store(c) with NO extra registers (the
+                # 80-reg occupancy-2 cap forbids a second full buffer).
+                # Stale basis (mneg), P stored over S ----
+                def ld_chunk(c, half):
+                    addr = reg.scalar(b32)
+                    ptx.inst.add.u32(addr, s_lo, c * 16)
+                    ptx.tcgen05.ld([vals[16 * half + i] for i in range(16)],
+                                   addr, shape="32x32b", count=16, dtype="b32")
+
+                ld_chunk(0, 0)
+                for c in range(8):
+                    ptx.tcgen05.wait_ld()
+                    if c < 7:
+                        ld_chunk(c + 1, (c + 1) & 1)
+                    off = 16 * (c & 1)
+                    v = [vals[off + i] for i in range(16)]
+                    for i in range(16):
+                        ptx.inst.fma.rn.f32(v[i], v[i], qk_scale_reg, mneg)
+                        ptx.inst.ex2.approx.ftz.f32(v[i], v[i])
+                    for k in range(8):
+                        ptx.inst.cvt.rn.bf16x2.f32(packed[k], v[2 * k + 1], v[2 * k])
                     pa = reg.scalar(b32)
-                    ptx.inst.add.u32(pa, p_lo, q * 16)
-                    ptx.tcgen05.st(pa, packed, shape="32x32b", count=16, dtype="b32")
+                    ptx.inst.add.u32(pa, p_lo, c * 8)
+                    ptx.tcgen05.st(pa, [packed[k] for k in range(8)],
+                                   shape="32x32b", count=8, dtype="b32")
                     for a in range(4):
                         t = reg.scalar(f32)
-                        ptx.inst.max.f32(t, vals[a], vals[4 + a], vals[8 + a])
-                        ptx.inst.max.f32(t, t, vals[12 + a], vals[16 + a])
-                        ptx.inst.max.f32(t, t, vals[20 + a], vals[24 + a])
-                        ptx.inst.max.f32(t, t, vals[28 + a])
+                        ptx.inst.max.f32(t, v[a], v[4 + a], v[8 + a])
+                        ptx.inst.max.f32(t, t, v[12 + a], v[12 + a])
                         s = reg.scalar(f32)
-                        ptx.inst.add.f32(s, vals[a], vals[4 + a])
-                        for i in range(8, 32, 4):
-                            ptx.inst.add.f32(s, s, vals[i + a])
-                        if q == 0:
+                        ptx.inst.add.f32(s, v[a], v[4 + a])
+                        ptx.inst.add.f32(s, s, v[8 + a])
+                        ptx.inst.add.f32(s, s, v[12 + a])
+                        if c == 0:
                             ptx.inst.mov.f32(macc[a], t)
                             ptx.inst.mov.f32(sacc[a], s)
                         else:
