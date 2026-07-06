@@ -20,6 +20,7 @@ from pyptx.ir.optimize import (
     copy_propagate,
     gvn_invariant,
     optimize_body,
+    split_false_deps,
     verify_body,
 )
 
@@ -157,6 +158,102 @@ class TestCopyPropagate:
             m.opcode != "mov" or m.operands[1].name != "%t" for m in _find(out, "mov")
         )
         assert verify_body(out) == []
+
+
+class TestSplitFalseDeps:
+    def _decls(self, *names, ty=".b32"):
+        return [RegDecl(type=ty, name=n, count=None) for n in names]
+
+    def test_splits_independent_reuse(self):
+        # %r reused for three independent values. First and last keep %r
+        # (live-in / live-out safety); the middle value(s) rename to fresh.
+        body = [
+            *self._decls("%base", "%out", "%r"),
+            ins("mov", [".u32"], R("%base"), R("%tid.x")),
+            ins("mov", [".u32"], R("%out"), R("%ntid.x")),
+            ins("add", [".b32"], R("%r"), R("%base"), I(1)),   # v0 (kill)
+            ins("st", [".global", ".b32"], AddressOperand("%out", 0), R("%r")),
+            ins("add", [".b32"], R("%r"), R("%base"), I(2)),   # v1 (kill)
+            ins("st", [".global", ".b32"], AddressOperand("%out", 8), R("%r")),
+            ins("add", [".b32"], R("%r"), R("%base"), I(3)),   # v2 (kill, last)
+            ins("st", [".global", ".b32"], AddressOperand("%out", 16), R("%r")),
+        ]
+        out = split_false_deps(list(body))
+        assert verify_body(out) == []
+        # each add now writes a distinct register (no WAW on %r across the 3)
+        add_dests = [s.operands[0].name for s in _find(out, "add")]
+        assert len(set(add_dests)) == 3
+        # the store immediately after each add reads that add's dest (dataflow
+        # preserved): pair them up in program order.
+        adds = _find(out, "add")
+        sts = _find(out, "st")
+        for a, st in zip(adds, sts):
+            assert st.operands[1].name == a.operands[0].name
+        # the last value still uses the original name
+        assert adds[-1].operands[0].name == "%r"
+
+    def test_carrying_def_not_split(self):
+        # %r = %r + 1 reads %r: a true RAW chain (accumulator), not a false
+        # dep. Must remain a single register.
+        body = [
+            *self._decls("%base", "%out", "%r"),
+            ins("mov", [".u32"], R("%base"), R("%tid.x")),
+            ins("mov", [".u32"], R("%out"), R("%ntid.x")),
+            ins("add", [".b32"], R("%r"), R("%base"), I(0)),   # init
+            ins("add", [".b32"], R("%r"), R("%r"), I(1)),      # carry (RAW)
+            ins("add", [".b32"], R("%r"), R("%r"), I(1)),      # carry (RAW)
+            ins("st", [".global", ".b32"], AddressOperand("%out", 0), R("%r")),
+        ]
+        out = split_false_deps(list(body))
+        assert out == body  # untouched — no false dep to break
+
+    def test_predicated_def_poisons_register(self):
+        # A conditional write to %r means %r's value isn't a clean single
+        # value; leave the whole register alone in this block.
+        body = [
+            *self._decls("%base", "%out", "%r", "%p", ty=".b32"),
+            ins("mov", [".u32"], R("%base"), R("%tid.x")),
+            ins("mov", [".u32"], R("%out"), R("%ntid.x")),
+            ins("add", [".b32"], R("%r"), R("%base"), I(1)),
+            ins("st", [".global", ".b32"], AddressOperand("%out", 0), R("%r")),
+            ins("add", [".b32"], R("%r"), R("%base"), I(2),
+                predicate=Predicate(register="%p", negated=False)),
+            ins("st", [".global", ".b32"], AddressOperand("%out", 8), R("%r")),
+        ]
+        out = split_false_deps(list(body))
+        assert out == body
+
+    def test_no_split_across_label(self):
+        # Values in different blocks (separated by a label) are analyzed
+        # independently; the register keeps its name across the boundary.
+        body = [
+            *self._decls("%base", "%out", "%r"),
+            ins("mov", [".u32"], R("%base"), R("%tid.x")),
+            ins("mov", [".u32"], R("%out"), R("%ntid.x")),
+            ins("add", [".b32"], R("%r"), R("%base"), I(1)),
+            ins("st", [".global", ".b32"], AddressOperand("%out", 0), R("%r")),
+            Label(name="cont"),
+            ins("add", [".b32"], R("%r"), R("%base"), I(2)),
+            ins("st", [".global", ".b32"], AddressOperand("%out", 8), R("%r")),
+        ]
+        out = split_false_deps(list(body))
+        # single value per block -> nothing to split
+        assert [s for s in out if isinstance(s, RegDecl) and s.name.startswith("%vs")] == []
+
+    def test_unknown_type_skipped(self):
+        # %r has no declaration -> can't declare a fresh reg of its type ->
+        # leave it alone rather than guess.
+        body = [
+            *self._decls("%base", "%out"),
+            ins("mov", [".u32"], R("%base"), R("%tid.x")),
+            ins("mov", [".u32"], R("%out"), R("%ntid.x")),
+            ins("add", [".b32"], R("%r"), R("%base"), I(1)),
+            ins("st", [".global", ".b32"], AddressOperand("%out", 0), R("%r")),
+            ins("add", [".b32"], R("%r"), R("%base"), I(2)),
+            ins("st", [".global", ".b32"], AddressOperand("%out", 8), R("%r")),
+        ]
+        out = split_false_deps(list(body))
+        assert out == body
 
 
 class TestOptimizeBody:

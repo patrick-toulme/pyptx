@@ -355,6 +355,213 @@ def _rewrite_gvn(statements, canon, folded, invariant, entry_end, inv_defs):
     return result
 
 
+# ---------------------------------------------------------------------------
+# False-dependency breaking (value splitting / SSA-lite).
+#
+# pyptx's imperative DSL reuses one scratch register for many *independent*
+# values (`%r = a; ...; %r = b; ...`). Each reuse is a WAR/WAW hazard that
+# forces ptxas to serialize the two computations and stretches one live
+# range, whereas CuTe's functional style names each value once and lets
+# ptxas schedule/allocate them freely. This pass restores that freedom:
+# inside a straight-line region, when a register is redefined by an
+# instruction that does NOT read it (a "killing" def), the previous value
+# is provably dead, so that value's def+uses are renamed to a fresh
+# register. The first value in a region (may read a live-in value) and the
+# last value (may be live-out) keep the original name — proving otherwise
+# needs cross-block liveness, so we conservatively don't touch them.
+#
+# Safety: only unpredicated, plain-scalar-register defs split a value; any
+# predicated or vector/complex-dest definition of a register makes that
+# register untouchable in the whole region. Fresh registers are declared
+# with the original's type; a register whose type can't be resolved from a
+# declaration is skipped. The result still passes verify_body, and — since
+# it grows the virtual-register count — needs ptxas/GPU validation before
+# it should be trusted to help rather than raise register pressure.
+# ---------------------------------------------------------------------------
+
+_BLOCK_ENDERS = frozenset({"bra", "ret", "call", "exit", "brkpt", "trap"})
+
+
+def _reg_type_lookup(statements):
+    """Return a fn name->declared-type, covering scalar and ranged decls."""
+    scalar: dict[str, str] = {}
+    ranged: list[tuple[str, str]] = []
+    for s in statements:
+        if isinstance(s, RegDecl):
+            if s.count is None:
+                scalar[s.name] = s.type
+            else:
+                ranged.append((s.name, s.type))
+
+    def lookup(name: str):
+        if name in scalar:
+            return scalar[name]
+        for pfx, ty in ranged:
+            if name.startswith(pfx) and name[len(pfx):].isdigit():
+                return ty
+        return None
+
+    return lookup
+
+
+def _def_and_uses(instr: Instruction):
+    """(def_reg | None, complex_def_regs, use_regs) for an instruction.
+
+    def_reg      — plain scalar destination register name (write-only), else None.
+    complex_defs — registers written via a vector/paren destination (multi-dest).
+    use_regs     — every register read: operands[1:], plus operand[0]'s registers
+                   when operand[0] is not a plain destination (e.g. st's address).
+    """
+    if not instr.operands:
+        return None, [], []
+    op0 = instr.operands[0]
+    def_reg = None
+    complex_defs: list[str] = []
+    op0_uses: list[str] = []
+    if isinstance(op0, RegisterOperand):
+        def_reg = op0.name
+    elif isinstance(op0, (VectorOperand, ParenthesizedOperand)):
+        complex_defs = _operand_reg_names(op0)
+    else:
+        # address / negated / pipe in dest position -> these registers are read
+        op0_uses = _operand_reg_names(op0)
+    uses: list[str] = list(op0_uses)
+    for op in instr.operands[1:]:
+        uses.extend(_operand_reg_names(op))
+    return def_reg, complex_defs, uses
+
+
+def split_false_deps(statements: list[Statement]) -> list[Statement]:
+    """Break WAR/WAW false dependencies by renaming dead reused values.
+
+    Within each straight-line region, a register's timeline is split into
+    independent values at every killing redefinition; each value that is
+    neither the region's first nor last (and whose defining instruction
+    does not read the register) is renamed to a fresh register.
+    """
+    reg_type = _reg_type_lookup(statements)
+
+    # existing names, to guarantee fresh ones don't collide
+    existing: set[str] = set()
+    for s in statements:
+        if isinstance(s, RegDecl):
+            existing.add(s.name)
+        elif isinstance(s, Instruction):
+            for op in s.operands:
+                existing.update(_operand_reg_names(op))
+    prefix = "%vs"
+    while any(n.startswith(prefix) for n in existing):
+        prefix += "_"
+
+    # per-index register renames to apply, and fresh decls to add
+    rename_at: dict[int, dict[str, str]] = {}
+    fresh_decls: list[RegDecl] = []
+    counter = 0
+
+    n = len(statements)
+    i = 0
+    while i < n:
+        # find the extent of this straight-line block [i, j)
+        # a block runs until (and including) a block-ender, or until just
+        # before a Label (which starts a new block / is a join point).
+        j = i
+        started = False
+        while j < n:
+            s = statements[j]
+            if isinstance(s, Label):
+                if started:
+                    break  # label begins a new block
+                # leading label(s) belong to this block start
+                j += 1
+                continue
+            started = True
+            j += 1
+            if isinstance(s, Instruction) and s.opcode in _BLOCK_ENDERS:
+                break
+        block = range(i, j)
+
+        # collect per-register def events + poison flags within the block
+        # def event: (index, kind) kind in {"kill","carry"}
+        defs: dict[str, list[tuple[int, str]]] = {}
+        poison: set[str] = set()
+        for k in block:
+            s = statements[k]
+            if not isinstance(s, Instruction):
+                continue
+            def_reg, complex_defs, uses = _def_and_uses(s)
+            for r in complex_defs:
+                poison.add(r)  # written via vector/paren dest -> hands off
+            if def_reg is None:
+                continue
+            if s.predicate is not None:
+                poison.add(def_reg)  # conditional write -> value not guaranteed
+                continue
+            kind = "carry" if def_reg in uses else "kill"
+            defs.setdefault(def_reg, []).append((k, kind))
+
+        for r, events in defs.items():
+            if r in poison:
+                continue
+            ty = reg_type(r)
+            if ty is None or ty == ".pred" or _is_special_reg(r):
+                continue
+            # value starts = first def, plus every killing def
+            starts: list[int] = []
+            for idx, kind in events:
+                if not starts or kind == "kill":
+                    starts.append(idx)
+            if len(starts) < 2:
+                continue  # single value in block -> nothing to split
+            # value spans; last value is kept (possible live-out)
+            for vi in range(len(starts) - 1):
+                start = starts[vi]
+                end = starts[vi + 1]  # exclusive
+                # only rename values whose defining instruction is a killing
+                # def (doesn't read r); a first value that reads a live-in is
+                # left alone.
+                def_kind = next(kind for idx, kind in events if idx == start)
+                if def_kind != "kill":
+                    continue
+                fresh = f"{prefix}{counter}"
+                counter += 1
+                fresh_decls.append(RegDecl(type=ty, name=fresh, count=None))
+                for k in range(start, end):
+                    s = statements[k]
+                    if not isinstance(s, Instruction):
+                        continue
+                    if r in _stmt_reg_names(s):
+                        rename_at.setdefault(k, {})[r] = fresh
+        i = j
+
+    if not rename_at:
+        return statements
+
+    from dataclasses import replace
+    result: list[Statement] = list(fresh_decls)
+    for k, s in enumerate(statements):
+        if k in rename_at and isinstance(s, Instruction):
+            renames = rename_at[k]
+            new_ops = tuple(_rename_operand(op, renames) for op in s.operands)
+            pred = s.predicate
+            if pred is not None and isinstance(getattr(pred, "register", None), str):
+                nc = renames.get(pred.register, pred.register)
+                if nc != pred.register:
+                    pred = replace(pred, register=nc)
+            if new_ops != s.operands or pred is not s.predicate:
+                s = replace(s, operands=new_ops, predicate=pred)
+        result.append(s)
+    return result
+
+
+def _stmt_reg_names(instr: Instruction) -> set[str]:
+    out: set[str] = set()
+    for op in instr.operands:
+        out.update(_operand_reg_names(op))
+    if instr.predicate is not None and isinstance(getattr(instr.predicate, "register", None), str):
+        out.add(instr.predicate.register)
+    return out
+
+
 def verify_body(statements: list[Statement]) -> list[str]:
     """Cheap structural verifier: catch dangling uses and multi-defined
     canonicals introduced by a buggy pass. Returns a list of problems
@@ -399,6 +606,7 @@ def optimize_body(statements: list[Statement], level: int = 1) -> list[Statement
 
     level 0: no-op (byte-identical to trace output).
     level 1: copy propagation + GVN/LICM of invariant computes (pass D).
+    level 2: + false-dependency breaking / value splitting (SSA-lite).
 
     Falls back to the input unchanged if the result fails verification —
     so a pass bug can never silently corrupt a kernel.
@@ -408,6 +616,8 @@ def optimize_body(statements: list[Statement], level: int = 1) -> list[Statement
     original = statements
     out = copy_propagate(list(statements))
     out = gvn_invariant(out)
+    if level >= 2:
+        out = split_false_deps(out)
     problems = verify_body(out)
     if problems:
         import warnings
