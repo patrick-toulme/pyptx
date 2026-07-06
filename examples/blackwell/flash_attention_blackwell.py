@@ -2455,9 +2455,13 @@ def build_flash_attention_blackwell_occ2(
             ptx.inst.mov.b32(p_lo, s_lo)
 
             qk_scale_reg = reg.scalar(f32, init=qk_scale)
-            neg_thresh = reg.scalar(f32, init=-rescale_threshold)
+            thresh_p = reg.scalar(f32, init=float(2.0 ** rescale_threshold))
             one_f = reg.scalar(f32, init=1.0)
-            m_run = reg.scalar(f32, init=-1e30)
+            # stale-basis state (exp against the pending basis immediately;
+            # max/decision deferred one tile — single TMEM load pass)
+            mneg = reg.scalar(f32, init=0.0)
+            pmax_pend = reg.scalar(f32, init=0.0)
+            sums_pend = reg.scalar(f32, init=0.0)
             l_run = reg.scalar(f32, init=0.0)
 
             alpha_addr = reg.scalar(u32)
@@ -2471,6 +2475,8 @@ def build_flash_attention_blackwell_occ2(
 
             vals = reg.array(f32, 32)
             packed = reg.array(b32, 16)
+            macc = [reg.scalar(f32) for _ in range(4)]
+            sacc = [reg.scalar(f32) for _ in range(4)]
 
             def ld_quarter(q):
                 addr = reg.scalar(b32)
@@ -2499,44 +2505,33 @@ def build_flash_attention_blackwell_occ2(
                 ptx.inst.xor.b32(ph_s, ph_s, 1)
                 ptx.tcgen05.fence_after_thread_sync()
 
-                # max pass over four 32-column quarters
-                pmax = reg.scalar(f32)
-                for q in range(4):
-                    ld_quarter(q)
-                    q_max(pmax, q == 0)
-
-                alpha = reg.scalar(f32)
+                # ---- deferred tail of tile k-1: basis decision from this
+                # thread's own row max on the exp'd values (no exchange) --
                 if not is_first:
-                    m_new = reg.scalar(f32)
-                    ptx.inst.max.f32(m_new, m_run, pmax)
-                    d = reg.scalar(f32)
-                    ptx.inst.sub.f32(d, m_run, m_new)
-                    ptx.inst.mul.f32(d, d, qk_scale_reg)
-                    keep = reg.scalar(pred)
-                    ptx.inst.setp.ge.f32(keep, d, neg_thresh)
-                    with ptx.if_(keep):
-                        ptx.inst.mov.f32(alpha, one_f)
-                    with ptx.else_():
-                        ptx.inst.ex2.approx.ftz.f32(alpha, d)
-                        ptx.inst.mov.f32(m_run, m_new)
+                    alpha = reg.scalar(f32)
+                    ptx.inst.mov.f32(alpha, one_f)
+                    move = reg.scalar(pred)
+                    ptx.inst.setp.gt.f32(move, pmax_pend, thresh_p)
+                    with ptx.if_(move):
+                        ptx.inst.rcp.approx.f32(alpha, pmax_pend)
+                        lgp = reg.scalar(f32)
+                        ptx.inst.lg2.approx.f32(lgp, pmax_pend)
+                        ptx.inst.sub.f32(mneg, mneg, lgp)
+                    ptx.inst.add.f32(l_run, l_run, sums_pend)
+                    ptx.inst.mul.f32(l_run, l_run, alpha)
                     ptx.mbarrier.wait(base + O2B_STATS_FREE, ph_stats)
                     ptx.inst.xor.b32(ph_stats, ph_stats, 1)
                     ptx.inst.st.shared.b32(ptx.addr(alpha_addr), alpha)
                     ptx.mbarrier.arrive(base + O2B_STATS_FULL)
-                else:
-                    ptx.inst.mov.f32(m_run, pmax)
 
-                m_scaled = reg.scalar(f32)
-                ptx.inst.mul.f32(m_scaled, m_run, qk_scale_reg)
-                ptx.inst.neg.f32(m_scaled, m_scaled)
-
-                # exp pass, quarter q's P words land on S columns already
-                # consumed by quarter q (sequential overwrite is safe)
-                lsum = reg.scalar(f32, init=0.0)
+                # ---- single exp pass over four 32-column quarters; stale
+                # basis (mneg), so no max pass in front. Store P over S,
+                # accumulate running max (for the deferred drift check) and
+                # sum on the exp'd values ----
                 for q in range(4):
                     ld_quarter(q)
                     for i in range(32):
-                        ptx.inst.fma.rn.f32(vals[i], vals[i], qk_scale_reg, m_scaled)
+                        ptx.inst.fma.rn.f32(vals[i], vals[i], qk_scale_reg, mneg)
                         ptx.inst.ex2.approx.ftz.f32(vals[i], vals[i])
                     for c in range(16):
                         ptx.inst.cvt.rn.bf16x2.f32(
@@ -2545,24 +2540,32 @@ def build_flash_attention_blackwell_occ2(
                     pa = reg.scalar(b32)
                     ptx.inst.add.u32(pa, p_lo, q * 16)
                     ptx.tcgen05.st(pa, packed, shape="32x32b", count=16, dtype="b32")
-                    acc = [reg.scalar(f32) for _ in range(4)]
                     for a in range(4):
-                        ptx.inst.add.f32(acc[a], vals[a], vals[4 + a])
-                    for i in range(8, 32, 4):
-                        for a in range(4):
-                            ptx.inst.add.f32(acc[a], acc[a], vals[i + a])
-                    ptx.inst.add.f32(acc[0], acc[0], acc[1])
-                    ptx.inst.add.f32(acc[2], acc[2], acc[3])
-                    ptx.inst.add.f32(acc[0], acc[0], acc[2])
-                    ptx.inst.add.f32(lsum, lsum, acc[0])
+                        t = reg.scalar(f32)
+                        ptx.inst.max.f32(t, vals[a], vals[4 + a], vals[8 + a])
+                        ptx.inst.max.f32(t, t, vals[12 + a], vals[16 + a])
+                        ptx.inst.max.f32(t, t, vals[20 + a], vals[24 + a])
+                        ptx.inst.max.f32(t, t, vals[28 + a])
+                        s = reg.scalar(f32)
+                        ptx.inst.add.f32(s, vals[a], vals[4 + a])
+                        for i in range(8, 32, 4):
+                            ptx.inst.add.f32(s, s, vals[i + a])
+                        if q == 0:
+                            ptx.inst.mov.f32(macc[a], t)
+                            ptx.inst.mov.f32(sacc[a], s)
+                        else:
+                            ptx.inst.max.f32(macc[a], macc[a], t)
+                            ptx.inst.add.f32(sacc[a], sacc[a], s)
                 ptx.tcgen05.wait_st()
                 ptx.tcgen05.fence_before_thread_sync()
                 ptx.mbarrier.arrive(base + O2B_P_FULL)
 
-                if is_first:
-                    ptx.inst.mov.f32(l_run, lsum)
-                else:
-                    ptx.inst.fma.rn.f32(l_run, l_run, alpha, lsum)
+                # horizontal reduce into the pending carries
+                ptx.inst.max.f32(macc[0], macc[0], macc[1], macc[2])
+                ptx.inst.max.f32(pmax_pend, macc[0], macc[3])
+                ptx.inst.add.f32(sacc[0], sacc[0], sacc[1])
+                ptx.inst.add.f32(sacc[2], sacc[2], sacc[3])
+                ptx.inst.add.f32(sums_pend, sacc[0], sacc[2])
 
             body(is_first=True)
             if n_tiles > 1:
@@ -2574,6 +2577,9 @@ def build_flash_attention_blackwell_occ2(
                     it += 1
                     ptx.inst.setp.lt.u32(go, it, n_tiles)
 
+            # drain: fold the last tile's sums into l (its basis decision
+            # never runs — the pending rescale cancels in the normalize)
+            ptx.inst.add.f32(l_run, l_run, sums_pend)
             ptx.inst.st.shared.b32(ptx.addr(sum_addr), l_run)
             ptx.mbarrier.arrive(base + O2B_STATS_FULL)
 
