@@ -13,6 +13,7 @@ allocatable defs/uses, so the passes only ever touch real virtual registers.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 
 from pyptx.ir.nodes import (
@@ -41,12 +42,21 @@ SIDE_EFFECTING = frozenset({
 })
 
 
+# Register tokens embedded in a raw-string operand field (e.g. the TMA
+# coordinate vector pyptx stores in AddressOperand.offset: ", {0, %r98}").
+_REG_TOKEN = re.compile(r"%[A-Za-z_][A-Za-z0-9_$]*")
+
+
 def operand_reg_names(op) -> list[str]:
     """Every register name referenced inside an operand (recursively)."""
     if isinstance(op, RegisterOperand):
         return [op.name]
     if isinstance(op, AddressOperand):
-        return [op.base]
+        names = [op.base]
+        if isinstance(op.offset, str):
+            # TMA / vector coordinates are stashed here as raw text
+            names += _REG_TOKEN.findall(op.offset)
+        return names
     if isinstance(op, (VectorOperand, ParenthesizedOperand)):
         out: list[str] = []
         for e in op.elements:

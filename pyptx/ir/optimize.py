@@ -158,12 +158,21 @@ _PURE_ALU = frozenset({
 })
 
 
+import re as _re
+# Register tokens embedded in a raw-string operand field (e.g. the TMA
+# coordinate vector pyptx stores in AddressOperand.offset: ", {0, %r98}").
+_REG_TOKEN = _re.compile(r"%[A-Za-z_][A-Za-z0-9_$]*")
+
+
 def _operand_reg_names(op) -> list[str]:
     """All register names read/written inside an operand (recursively)."""
     if isinstance(op, RegisterOperand):
         return [op.name]
     if isinstance(op, AddressOperand):
-        return [op.base]
+        names = [op.base]
+        if isinstance(op.offset, str):
+            names += _REG_TOKEN.findall(op.offset)
+        return names
     if isinstance(op, (VectorOperand, ParenthesizedOperand)):
         out: list[str] = []
         for e in op.elements:
@@ -1148,6 +1157,24 @@ _LEVEL_PRESETS = {
 }
 
 
+def _hoist_declarations(statements: list[Statement]) -> list[Statement]:
+    """Float every register declaration to the top of the body.
+
+    pyptx emits each ``.reg`` declaration just before the register's first
+    use. That is valid only while instructions keep their traced order — any
+    pass that hoists or reorders an instruction above its register's
+    declaration produces PTX that ptxas rejects ("Arguments mismatch", the
+    register being untyped at that point), even though pyptx's own parser and
+    verify_body accept it. Declaring all registers up front (standard PTX) is
+    order-independent and makes the body robust to every reordering pass.
+    """
+    decls = [s for s in statements if isinstance(s, RegDecl)]
+    rest = [s for s in statements if not isinstance(s, RegDecl)]
+    if not decls:
+        return statements
+    return decls + rest
+
+
 def optimize_body(statements, level: int = 1, passes=None) -> list[Statement]:
     """Run the optimization pipeline on one function body.
 
@@ -1182,6 +1209,11 @@ def optimize_body(statements, level: int = 1, passes=None) -> list[Statement]:
                           f"({problems[:3]}); skipping", RuntimeWarning)
             continue
         out = candidate
+    # Normalize: any pass may have reordered an instruction above its
+    # register's declaration; float all declarations to the top so ptxas
+    # (which requires declare-before-use) accepts the result.
+    if out is not statements:
+        out = _hoist_declarations(out)
     return out
 
 
@@ -1213,8 +1245,12 @@ def _rename_operand(op, renames: dict[str, str]):
         return op
     if isinstance(op, AddressOperand):
         new_base = renames.get(op.base, op.base)
-        if new_base != op.base:
-            return AddressOperand(base=new_base, offset=op.offset)
+        new_offset = op.offset
+        if isinstance(op.offset, str):
+            new_offset = _REG_TOKEN.sub(
+                lambda mm: renames.get(mm.group(0), mm.group(0)), op.offset)
+        if new_base != op.base or new_offset != op.offset:
+            return AddressOperand(base=new_base, offset=new_offset)
         return op
     if isinstance(op, VectorOperand):
         new_elems = tuple(_rename_operand(e, renames) for e in op.elements)

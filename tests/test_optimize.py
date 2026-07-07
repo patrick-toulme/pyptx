@@ -504,6 +504,48 @@ class TestSsaReconstruct:
         assert st.operands[1].name == "%r"
 
 
+class TestTmaOffsetRegisters:
+    """Registers embedded in AddressOperand.offset (pyptx stores TMA
+    coordinate vectors there as raw text, e.g. ", {0, %r5}") must be visible
+    to liveness/def-use and renamed consistently — otherwise DCE removes their
+    definition and regalloc corrupts them, producing PTX ptxas rejects.
+    """
+
+    def test_operand_reg_names_reads_offset(self):
+        from pyptx.ir.optimize import _operand_reg_names
+        ao = AddressOperand("%rd6", ", {0, %r5}")
+        assert _operand_reg_names(ao) == ["%rd6", "%r5"]
+
+    def test_rename_touches_offset(self):
+        from pyptx.ir.optimize import _rename_operand
+        ao = AddressOperand("%rd6", ", {0, %r5}")
+        out = _rename_operand(ao, {"%r5": "%q9"})
+        assert out.offset == ", {0, %q9}"
+
+    def test_dce_keeps_def_used_only_in_offset(self):
+        # %coord is used ONLY inside a TMA-style offset string; DCE must not
+        # treat it as dead.
+        body = [
+            RegDecl(type=".u32", name="%coord", count=None),
+            RegDecl(type=".b64", name="%tmap", count=None),
+            RegDecl(type=".u32", name="%dst", count=None),
+            RegDecl(type=".u32", name="%bar", count=None),
+            ins("mov", [".u32"], R("%coord"), R("%tid.x")),
+            ins("mov", [".u32"], R("%dst"), R("%ntid.x")),
+            ins("mov", [".b64"], R("%tmap"), R("%ntid.x")),
+            ins("mov", [".u32"], R("%bar"), R("%ntid.x")),
+            ins("cp", [".async", ".bulk", ".tensor"],
+                AddressOperand("%dst", None),
+                AddressOperand("%tmap", ", {0, %coord}"),
+                AddressOperand("%bar", None)),
+            ins("ret", []),
+        ]
+        out = dead_code_eliminate(list(body))
+        # the def of %coord survives
+        assert any(isinstance(s, Instruction) and s.opcode == "mov"
+                   and s.operands[0].name == "%coord" for s in out)
+
+
 class TestOptimizeBody:
     def test_level_zero_is_identity(self):
         body = [

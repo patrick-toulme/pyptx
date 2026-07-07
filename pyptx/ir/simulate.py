@@ -28,6 +28,7 @@ equal by construction.
 from __future__ import annotations
 
 import hashlib
+import re
 
 from pyptx.ir.nodes import (
     AddressOperand,
@@ -42,6 +43,9 @@ from pyptx.ir.nodes import (
     VectorOperand,
 )
 from pyptx.ir.analysis import SIDE_EFFECTING, is_special_reg, operand_reg_names
+
+
+_REG_TOKEN = re.compile(r"%[A-Za-z_][A-Za-z0-9_$]*")
 
 
 def _h(s: str) -> str:
@@ -89,7 +93,13 @@ def symbolic_trace(statements, event_cap: int = 200000, step_cap: int = 5_000_00
         if isinstance(op, AddressOperand):
             base = op.base
             b = leaf(base) if isinstance(base, str) and base.startswith("%") else _h("sym:" + str(base))
-            return _h("addr:%s+%s" % (b, op.offset))
+            off = op.offset
+            if isinstance(off, str):
+                # resolve registers embedded in the raw offset (TMA coords)
+                # to their current values, so orphaned/renamed regs there are
+                # observed rather than compared as opaque text.
+                off = _REG_TOKEN.sub(lambda mm: leaf(mm.group(0)), off)
+            return _h("addr:%s+%s" % (b, off))
         if isinstance(op, NegatedOperand):
             return _h("neg:" + key(op.operand))
         if isinstance(op, VectorOperand):
