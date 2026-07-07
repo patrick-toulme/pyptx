@@ -824,12 +824,13 @@ class Kernel:
         Every pass self-verifies and is skipped on any structural anomaly.
         """
         import os
+        force = os.environ.get("PYPTX_FORCE", "0") not in ("0", "", None)
         passes_env = os.environ.get("PYPTX_PASSES")
         if passes_env:
             passes = [p.strip() for p in passes_env.split(",") if p.strip()]
             if passes:
                 from pyptx.ir.optimize import optimize_module
-                module = optimize_module(module, passes=passes)
+                module = optimize_module(module, passes=passes, force=force)
             return emit(module)
         level_s = os.environ.get("PYPTX_OPT", "0") or "0"
         try:
@@ -838,7 +839,7 @@ class Kernel:
             level = 0
         if level >= 1:
             from pyptx.ir.optimize import optimize_module
-            module = optimize_module(module, level=level)
+            module = optimize_module(module, level=level, force=force)
         return emit(module)
 
     def module(self, **kwargs: Any) -> Module:

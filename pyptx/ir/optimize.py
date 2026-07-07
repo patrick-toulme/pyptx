@@ -1175,7 +1175,7 @@ def _hoist_declarations(statements: list[Statement]) -> list[Statement]:
     return decls + rest
 
 
-def optimize_body(statements, level: int = 1, passes=None) -> list[Statement]:
+def optimize_body(statements, level: int = 1, passes=None, force: bool = False) -> list[Statement]:
     """Run the optimization pipeline on one function body.
 
     Pass selection: an explicit `passes` name list wins; otherwise the
@@ -1202,11 +1202,13 @@ def optimize_body(statements, level: int = 1, passes=None) -> list[Statement]:
     # at runtime while producing dataflow-equivalent PTX. So refuse to touch a
     # body that uses setmaxnreg; the optimization can't help it (the gap is
     # ptxas SASS quality, below the PTX layer) and can only break its tuning.
-    if any(isinstance(s, Instruction) and s.opcode == "setmaxnreg" for s in statements):
+    if not force and any(isinstance(s, Instruction) and s.opcode == "setmaxnreg"
+                         for s in statements):
         warnings.warn(
             "pyptx.optimize: kernel uses setmaxnreg (hand-tuned register "
             "budgets); skipping optimization — allocation-perturbing passes "
-            "break the setmaxnreg balance at runtime",
+            "break the setmaxnreg balance at runtime (set PYPTX_FORCE=1 to "
+            "override, e.g. for measurement)",
             RuntimeWarning,
         )
         return statements
@@ -1238,7 +1240,7 @@ def optimize_body(statements, level: int = 1, passes=None) -> list[Statement]:
     return out
 
 
-def optimize_module(module, level: int = 1, passes=None):
+def optimize_module(module, level: int = 1, passes=None, force: bool = False):
     """Apply the pipeline to every Function body in a Module."""
     if passes is None and level < 1:
         return module
@@ -1247,7 +1249,7 @@ def optimize_module(module, level: int = 1, passes=None):
     changed = False
     for d in module.directives:
         if type(d).__name__ == "Function" and getattr(d, "body", None):
-            new_body = optimize_body(list(d.body), level=level, passes=passes)
+            new_body = optimize_body(list(d.body), level=level, passes=passes, force=force)
             if tuple(new_body) != d.body:
                 d = replace(d, body=tuple(new_body))
                 changed = True
