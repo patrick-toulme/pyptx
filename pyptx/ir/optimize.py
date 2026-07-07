@@ -1190,6 +1190,27 @@ def optimize_body(statements, level: int = 1, passes=None) -> list[Statement]:
         passes = _LEVEL_PRESETS.get(level, _LEVEL_PRESETS[max(_LEVEL_PRESETS)])
     registry = _pass_registry()
     import warnings
+
+    # SAFETY: a kernel that hand-tunes per-warp register budgets via
+    # `setmaxnreg` depends on ptxas allocating a SPECIFIC number of registers
+    # per warpgroup — a `setmaxnreg.inc N` becomes an illegal instruction at
+    # runtime if the warp is already allocated more than N. These passes are
+    # semantics-preserving at the register-dataflow level (differentially
+    # validated), but any of them — even DCE removing provably-dead code —
+    # perturbs ptxas's allocation and breaks that balance. Verified on the
+    # Blackwell FA kernel (B200, CUDA 13): dce/regalloc/ssa/schedule all fault
+    # at runtime while producing dataflow-equivalent PTX. So refuse to touch a
+    # body that uses setmaxnreg; the optimization can't help it (the gap is
+    # ptxas SASS quality, below the PTX layer) and can only break its tuning.
+    if any(isinstance(s, Instruction) and s.opcode == "setmaxnreg" for s in statements):
+        warnings.warn(
+            "pyptx.optimize: kernel uses setmaxnreg (hand-tuned register "
+            "budgets); skipping optimization — allocation-perturbing passes "
+            "break the setmaxnreg balance at runtime",
+            RuntimeWarning,
+        )
+        return statements
+
     out = list(statements)
     for name in passes:
         fn = registry.get(name)
