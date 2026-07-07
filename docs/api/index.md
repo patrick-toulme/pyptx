@@ -4,6 +4,7 @@ These pages are generated from the `pyptx/` package and module docstrings.
 
 - [`pyptx`](pyptx.md): Top-level public API for :mod:`pyptx`.
 - [`pyptx.cache`](cache.md): Disk cache for compiled PTX → cubin.
+- [`pyptx.debugkit`](debugkit.md): Kernel debugging utilities: beacon waits and phase cycle counters.
 - [`pyptx.jax_support`](jax_support.md): JAX runtime integration for :func:`pyptx.kernel`.
 - [`pyptx.kernel`](kernel.md): Kernel tracing, specialization, and runtime dispatch.
 - [`pyptx.ptx`](ptx.md): PTX instruction namespace.

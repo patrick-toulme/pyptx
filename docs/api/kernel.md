@@ -286,6 +286,18 @@ available.
 Usage:
     print(my_kernel.sass(M=4096, N=4096, K=4096))
 
+#### `resources(**kwargs: 'Any') -> 'dict'`
+
+- Kind: `method`
+
+Compile with ptxas -v and report launch resources + occupancy math.
+
+Returns a dict with registers, spills, per-CTA shared memory,
+setmaxnreg region values found in the PTX, and the CTAs-per-SM
+bound implied by each resource (the binding constraint is the
+minimum). Answers "why won't a second CTA fit on the SM" without
+guess-compile-fail loops.
+
 <a id="kernel"></a>
 
 ## `kernel`
