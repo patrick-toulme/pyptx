@@ -86,7 +86,7 @@ Base 0 means to interpret the base from the string as an integer literal.
 
 - Kind: `attribute`
 
-- Value: `<built-in method conjugate of int object at 0x7f106ecf3490>`
+- Value: `<built-in method conjugate of int object at 0x7f4d78df3770>`
 
 Returns self, the complex conjugate of any int.
 
@@ -94,7 +94,7 @@ Returns self, the complex conjugate of any int.
 
 - Kind: `attribute`
 
-- Value: `<built-in method bit_length of int object at 0x7f106ecf3490>`
+- Value: `<built-in method bit_length of int object at 0x7f4d78df3770>`
 
 Number of bits necessary to represent self in binary.
 
@@ -107,7 +107,7 @@ Number of bits necessary to represent self in binary.
 
 - Kind: `attribute`
 
-- Value: `<built-in method bit_count of int object at 0x7f106ecf3490>`
+- Value: `<built-in method bit_count of int object at 0x7f4d78df3770>`
 
 Number of ones in the binary representation of the absolute value of self.
 
@@ -122,7 +122,7 @@ Also known as the population count.
 
 - Kind: `attribute`
 
-- Value: `<built-in method to_bytes of int object at 0x7f106ecf3490>`
+- Value: `<built-in method to_bytes of int object at 0x7f4d78df3770>`
 
 Return an array of bytes representing an integer.
 
@@ -145,7 +145,7 @@ signed
 
 - Kind: `attribute`
 
-- Value: `<built-in method from_bytes of type object at 0x7f106fb30840>`
+- Value: `<built-in method from_bytes of type object at 0x7f4d79b30840>`
 
 Return the integer represented by the given array of bytes.
 
@@ -167,7 +167,7 @@ signed
 
 - Kind: `attribute`
 
-- Value: `<built-in method as_integer_ratio of int object at 0x7f106ecf3490>`
+- Value: `<built-in method as_integer_ratio of int object at 0x7f4d78df3770>`
 
 Return a pair of integers, whose ratio is equal to the original int.
 
@@ -184,7 +184,7 @@ The ratio is in lowest terms and has a positive denominator.
 
 - Kind: `attribute`
 
-- Value: `<built-in method is_integer of int object at 0x7f106ecf3490>`
+- Value: `<built-in method is_integer of int object at 0x7f4d78df3770>`
 
 Returns True. Exists for duck type compatibility with float.is_integer.
 
@@ -301,7 +301,7 @@ Base 0 means to interpret the base from the string as an integer literal.
 
 - Kind: `attribute`
 
-- Value: `<built-in method conjugate of int object at 0x7f106fc1d3c8>`
+- Value: `<built-in method conjugate of int object at 0x7f4d79c1d3c8>`
 
 Returns self, the complex conjugate of any int.
 
@@ -309,7 +309,7 @@ Returns self, the complex conjugate of any int.
 
 - Kind: `attribute`
 
-- Value: `<built-in method bit_length of int object at 0x7f106fc1d3c8>`
+- Value: `<built-in method bit_length of int object at 0x7f4d79c1d3c8>`
 
 Number of bits necessary to represent self in binary.
 
@@ -322,7 +322,7 @@ Number of bits necessary to represent self in binary.
 
 - Kind: `attribute`
 
-- Value: `<built-in method bit_count of int object at 0x7f106fc1d3c8>`
+- Value: `<built-in method bit_count of int object at 0x7f4d79c1d3c8>`
 
 Number of ones in the binary representation of the absolute value of self.
 
@@ -337,7 +337,7 @@ Also known as the population count.
 
 - Kind: `attribute`
 
-- Value: `<built-in method to_bytes of int object at 0x7f106fc1d3c8>`
+- Value: `<built-in method to_bytes of int object at 0x7f4d79c1d3c8>`
 
 Return an array of bytes representing an integer.
 
@@ -360,7 +360,7 @@ signed
 
 - Kind: `attribute`
 
-- Value: `<built-in method from_bytes of type object at 0x7f106fb30840>`
+- Value: `<built-in method from_bytes of type object at 0x7f4d79b30840>`
 
 Return the integer represented by the given array of bytes.
 
@@ -382,7 +382,7 @@ signed
 
 - Kind: `attribute`
 
-- Value: `<built-in method as_integer_ratio of int object at 0x7f106fc1d3c8>`
+- Value: `<built-in method as_integer_ratio of int object at 0x7f4d79c1d3c8>`
 
 Return a pair of integers, whose ratio is equal to the original int.
 
@@ -399,7 +399,7 @@ The ratio is in lowest terms and has a positive denominator.
 
 - Kind: `attribute`
 
-- Value: `<built-in method is_integer of int object at 0x7f106fc1d3c8>`
+- Value: `<built-in method is_integer of int object at 0x7f4d79c1d3c8>`
 
 Returns True. Exists for duck type compatibility with float.is_integer.
 
@@ -516,7 +516,7 @@ Base 0 means to interpret the base from the string as an integer literal.
 
 - Kind: `attribute`
 
-- Value: `<built-in method conjugate of int object at 0x7f106ecf0c70>`
+- Value: `<built-in method conjugate of int object at 0x7f4d78df2210>`
 
 Returns self, the complex conjugate of any int.
 
@@ -524,7 +524,7 @@ Returns self, the complex conjugate of any int.
 
 - Kind: `attribute`
 
-- Value: `<built-in method bit_length of int object at 0x7f106ecf0c70>`
+- Value: `<built-in method bit_length of int object at 0x7f4d78df2210>`
 
 Number of bits necessary to represent self in binary.
 
@@ -537,7 +537,7 @@ Number of bits necessary to represent self in binary.
 
 - Kind: `attribute`
 
-- Value: `<built-in method bit_count of int object at 0x7f106ecf0c70>`
+- Value: `<built-in method bit_count of int object at 0x7f4d78df2210>`
 
 Number of ones in the binary representation of the absolute value of self.
 
@@ -552,7 +552,7 @@ Also known as the population count.
 
 - Kind: `attribute`
 
-- Value: `<built-in method to_bytes of int object at 0x7f106ecf0c70>`
+- Value: `<built-in method to_bytes of int object at 0x7f4d78df2210>`
 
 Return an array of bytes representing an integer.
 
@@ -575,7 +575,7 @@ signed
 
 - Kind: `attribute`
 
-- Value: `<built-in method from_bytes of type object at 0x7f106fb30840>`
+- Value: `<built-in method from_bytes of type object at 0x7f4d79b30840>`
 
 Return the integer represented by the given array of bytes.
 
@@ -597,7 +597,7 @@ signed
 
 - Kind: `attribute`
 
-- Value: `<built-in method as_integer_ratio of int object at 0x7f106ecf0c70>`
+- Value: `<built-in method as_integer_ratio of int object at 0x7f4d78df2210>`
 
 Return a pair of integers, whose ratio is equal to the original int.
 
@@ -614,7 +614,7 @@ The ratio is in lowest terms and has a positive denominator.
 
 - Kind: `attribute`
 
-- Value: `<built-in method is_integer of int object at 0x7f106ecf0c70>`
+- Value: `<built-in method is_integer of int object at 0x7f4d78df2210>`
 
 Returns True. Exists for duck type compatibility with float.is_integer.
 
@@ -834,7 +834,7 @@ Base 0 means to interpret the base from the string as an integer literal.
 
 - Kind: `attribute`
 
-- Value: `<built-in method conjugate of int object at 0x7f106fc1d4c8>`
+- Value: `<built-in method conjugate of int object at 0x7f4d79c1d4c8>`
 
 Returns self, the complex conjugate of any int.
 
@@ -842,7 +842,7 @@ Returns self, the complex conjugate of any int.
 
 - Kind: `attribute`
 
-- Value: `<built-in method bit_length of int object at 0x7f106fc1d4c8>`
+- Value: `<built-in method bit_length of int object at 0x7f4d79c1d4c8>`
 
 Number of bits necessary to represent self in binary.
 
@@ -855,7 +855,7 @@ Number of bits necessary to represent self in binary.
 
 - Kind: `attribute`
 
-- Value: `<built-in method bit_count of int object at 0x7f106fc1d4c8>`
+- Value: `<built-in method bit_count of int object at 0x7f4d79c1d4c8>`
 
 Number of ones in the binary representation of the absolute value of self.
 
@@ -870,7 +870,7 @@ Also known as the population count.
 
 - Kind: `attribute`
 
-- Value: `<built-in method to_bytes of int object at 0x7f106fc1d4c8>`
+- Value: `<built-in method to_bytes of int object at 0x7f4d79c1d4c8>`
 
 Return an array of bytes representing an integer.
 
@@ -893,7 +893,7 @@ signed
 
 - Kind: `attribute`
 
-- Value: `<built-in method from_bytes of type object at 0x7f106fb30840>`
+- Value: `<built-in method from_bytes of type object at 0x7f4d79b30840>`
 
 Return the integer represented by the given array of bytes.
 
@@ -915,7 +915,7 @@ signed
 
 - Kind: `attribute`
 
-- Value: `<built-in method as_integer_ratio of int object at 0x7f106fc1d4c8>`
+- Value: `<built-in method as_integer_ratio of int object at 0x7f4d79c1d4c8>`
 
 Return a pair of integers, whose ratio is equal to the original int.
 
@@ -932,7 +932,7 @@ The ratio is in lowest terms and has a positive denominator.
 
 - Kind: `attribute`
 
-- Value: `<built-in method is_integer of int object at 0x7f106fc1d4c8>`
+- Value: `<built-in method is_integer of int object at 0x7f4d79c1d4c8>`
 
 Returns True. Exists for duck type compatibility with float.is_integer.
 
